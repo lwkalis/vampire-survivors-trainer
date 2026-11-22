@@ -258,9 +258,14 @@ def start_configured_run(
                 title_splash_clicked = True
                 message = "title-menu: advancing past the title splash"
             elif (not title_start_clicked
-                  and ("quickstart" in screen or "vampiresurvivors" in screen)
-                  and click_ocr_label(
-                    bridge, frame, "Start", (.50, .65), (screen_text, screen_lines))):
+                  and ("quickstart" in screen or "vampiresurvivors" in screen)):
+                # Tesseract often sees the title art but misses the large
+                # central START button. The title-menu layout is stable, so
+                # use its calibrated button center when OCR has no label box.
+                if not click_ocr_label(
+                    bridge, frame, "Start", (.50, .65), (screen_text, screen_lines),
+                ):
+                    bridge.click_client(.50, .65)
                 title_start_clicked = True
                 message = "title-menu: clicked Start"
             else:
