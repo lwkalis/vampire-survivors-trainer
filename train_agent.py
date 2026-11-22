@@ -170,10 +170,20 @@ def start_configured_run(
             screen_text, screen_lines = read_screen_ocr(frame)
             screen = _label_key(screen_text)
             startup_labels = ("characterselection", "stageselection", "firstsurvivaton",
-                              "vampiresurvivors", "quickstart", "gameover")
+                              "vampiresurvivors", "quickstart", "gameover",
+                              "photosensitivitywarning")
             if not any(label in screen for label in startup_labels):
                 screen_text, screen_lines = read_screen_ocr(frame, white_text=True)
                 screen = _label_key(screen_text)
+            if ("photosensitivity" in screen and "warning" in screen
+                    and ("presstostart" in screen or "start" in screen)):
+                # The first-launch disclaimer is a separate screen from the
+                # ordinary title splash. Its button sits near the bottom
+                # center of the game client (about 82% down the frame).
+                bridge.click_client(.50, .82)
+                message = "startup: acknowledged the photosensitivity warning"
+                time.sleep(.45)
+                continue
             if "gameover" in screen:
                 print("startup: Game Over detected in OCR; returning to title", flush=True)
                 remaining = max(.1, deadline - time.monotonic())
