@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.local-deps/
+
+# Training state, reports, and captures
+data/**
+!data/.gitkeep
+run-evidence/
+
+# Local machine files
+.DS_Store
+Thumbs.db
