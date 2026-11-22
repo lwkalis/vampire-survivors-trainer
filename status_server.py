@@ -60,7 +60,13 @@ def launch_game() -> tuple[bool, str]:
     with LOCK:
         if game_running():
             return False, "Vampire Survivors is already running."
-        steam = shutil.which("steam")
+        steam = shutil.which("steam") or next(
+            (str(candidate) for candidate in (
+                Path("/usr/games/steam"), Path("/usr/bin/steam"),
+                Path("/usr/local/bin/steam"),
+            ) if candidate.is_file() and os.access(candidate, os.X_OK)),
+            None,
+        )
         if not steam:
             return False, "Steam was not found on this VM."
         try:
