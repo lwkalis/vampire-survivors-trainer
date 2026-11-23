@@ -200,12 +200,15 @@ def stage_checkbox_checked(frame, stage: str) -> bool:
 
 def start_configured_run(
     bridge: VampireSurvivorsBridge, timeout: float, *, allow_active: bool = False,
-    reporter: ScreenStatusReporter | None = None,
+    reporter: ScreenStatusReporter | None = None, first_launch: bool = False,
 ) -> None:
     """Navigate title → Gennaro → Inlaid Library → gameplay, verifying each screen."""
     deadline = time.monotonic() + timeout
     title_start_clicked = False
     title_splash_clicked = False
+    title_start_last_attempt = 0.0
+    first_launch_advance_sent = False
+    photosensitivity_attempts = 0
     run_start_clicked = False
     character_clicked = False
     character_confirmed = False
@@ -232,6 +235,7 @@ def start_configured_run(
                     return_to_title_after_death(bridge, remaining, reporter=reporter)
                     title_start_clicked = False
                     title_splash_clicked = False
+                    title_start_last_attempt = 0.0
                     run_start_clicked = False
                     character_clicked = False
                     character_confirmed = False
@@ -265,21 +269,39 @@ def start_configured_run(
                 screen = _label_key(screen_text)
             if reporter is not None:
                 reporter.publish(frame, startup_screen_phase(screen), screen_text=screen_text)
-            if ("photosensitivity" in screen and "warning" in screen
-                    and ("presstostart" in screen or "start" in screen)):
-                # The first-launch disclaimer is a separate screen from the
-                # ordinary title splash. Its button sits near the bottom
-                # center of the game client (about 82% down the frame).
-                bridge.click_client(.50, .82)
-                message = "startup: acknowledged the photosensitivity warning"
-                time.sleep(MENU_POST_CLICK_DELAY)
-                continue
-            if "gameover" in screen:
+            if "photosensitivity" in screen and "warning" in screen:
+                # The first-launch disclaimer can require an extra input after
+                # the initial acknowledgment. Click its lower-center button,
+                # then tap Enter once if the warning remains visible.
+                if photosensitivity_attempts < 2:
+                    photosensitivity_attempts += 1
+                    if photosensitivity_attempts == 1:
+                        bridge.click_client(.50, .82)
+                        message = "startup: acknowledged the photosensitivity warning"
+                    else:
+                        bridge.press_key("enter")
+                        message = "startup: sent extra photosensitivity input"
+                else:
+                    message = "startup: waiting for photosensitivity warning to clear"
+            elif (
+                first_launch and not first_launch_advance_sent
+                and not any(label in screen for label in (
+                    "characterselection", "stageselection", "firstsurvivaton",
+                    "quickstart", "vampiresurvivors", "gameover",
+                ))
+            ):
+                # OCR can miss the first-launch disclaimer entirely. A single
+                # Enter advances it; inspect the new screen before acting again.
+                bridge.press_key("enter")
+                first_launch_advance_sent = True
+                message = "startup: sent first-launch continue input"
+            elif "gameover" in screen:
                 print("startup: Game Over detected in OCR; returning to title", flush=True)
                 remaining = max(.1, deadline - time.monotonic())
                 return_to_title_after_death(bridge, remaining, reporter=reporter)
                 title_start_clicked = False
                 title_splash_clicked = False
+                title_start_last_attempt = 0.0
                 run_start_clicked = False
                 character_clicked = False
                 character_confirmed = False
@@ -288,7 +310,7 @@ def start_configured_run(
                 stage_start_clicked = False
                 last_message = None
                 continue
-            if "characterselection" in screen:
+            elif "characterselection" in screen:
                 if not character_clicked:
                     if click_ocr_label(bridge, frame, "Gennaro", (.645, .28), (screen_text, screen_lines)):
                         character_clicked = True
@@ -343,21 +365,31 @@ def start_configured_run(
                     message = "selection: retrying Inlaid Library Start"
                 else:
                     message = "selection: waiting for Inlaid Library to start"
-            elif (not title_splash_clicked and "firstsurvivaton" in screen):
-                bridge.click_client(.50, .65)
-                title_splash_clicked = True
-                message = "title-menu: advancing past the title splash"
-            elif (not title_start_clicked
-                  and ("quickstart" in screen or "vampiresurvivors" in screen)):
-                # Tesseract often sees the title art but misses the large
-                # central START button. The title-menu layout is stable, so
-                # use its calibrated button center when OCR has no label box.
-                if not click_ocr_label(
-                    bridge, frame, "Start", (.50, .65), (screen_text, screen_lines),
-                ):
-                    bridge.click_client(.50, .65)
-                title_start_clicked = True
-                message = "title-menu: clicked Start"
+            elif (
+                title_splash_clicked
+                or "firstsurvivaton" in screen
+                or "quickstart" in screen
+                or "vampiresurvivors" in screen
+            ):
+                # The title tagline can appear on the menu while OCR misses
+                # the visible START label. Retry the calibrated button until
+                # the character/stage selection screen is recognized.
+                now = time.monotonic()
+                if not title_start_clicked or now - title_start_last_attempt >= 1.5:
+                    retrying = title_start_clicked
+                    if not click_ocr_label(
+                        bridge, frame, "Start", (.50, .65), (screen_text, screen_lines),
+                    ):
+                        bridge.click_client(.50, .65)
+                    title_start_clicked = True
+                    title_splash_clicked = True
+                    title_start_last_attempt = now
+                    message = (
+                        "title-menu: retrying Start" if retrying
+                        else "title-menu: clicked Start"
+                    )
+                else:
+                    message = "menu-check: waiting for title menu response"
             else:
                 message = "menu-check: waiting for Start or the next selection screen"
         if message != last_message:
@@ -687,7 +719,7 @@ def main() -> None:
                 )
         start_configured_run(
             bridge, args.focus_timeout, allow_active=args.attach,
-            reporter=screen_reporter,
+            reporter=screen_reporter, first_launch=True,
         )
     elif args.control:
         bridge.activate()  # Best effort; Windows may require a user click.

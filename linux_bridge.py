@@ -127,6 +127,15 @@ class VampireSurvivorsBridge:
                   str(px), str(py), "sleep", "0.04",
                   "mousedown", "1", "sleep", "0.06", "mouseup", "1")
 
+    def press_key(self, key: str) -> None:
+        """Tap a supported menu key after confirming the game has focus."""
+        key_name = {"enter": "Return", "space": "space"}.get(key.casefold())
+        if key_name is None:
+            raise ValueError(f"Unsupported menu key: {key}")
+        if not self.is_foreground():
+            raise RuntimeError("Vampire Survivors is not foreground; refusing key input")
+        self._run("xdotool", "key", key_name)
+
     def key_down(self, direction: str) -> bool:
         """Return whether this bridge currently holds the requested movement key."""
         return direction.casefold() in self._held
