@@ -162,7 +162,9 @@ def click_ocr_label(
             continue
         actual = _label_key(str(line.get("text", "")))
         similar = difflib.SequenceMatcher(None, actual, wanted).ratio() >= .82
-        prefix_match = wanted in {"quit", "options", "start"} and actual.startswith(wanted)
+        prefix_match = (
+            wanted in {"quit", "options", "start"} and actual.startswith(wanted)
+        ) or (wanted == "poe" and actual.startswith("poeratcho"))
         if actual != wanted and not similar and not prefix_match:
             continue
         try:
@@ -202,7 +204,7 @@ def start_configured_run(
     bridge: VampireSurvivorsBridge, timeout: float, *, allow_active: bool = False,
     reporter: ScreenStatusReporter | None = None, first_launch: bool = False,
 ) -> None:
-    """Navigate title → Gennaro → Inlaid Library → gameplay, verifying each screen."""
+    """Navigate title → Poe → Inlaid Library → gameplay, verifying each screen."""
     deadline = time.monotonic() + timeout
     title_start_clicked = False
     title_splash_clicked = False
@@ -253,7 +255,7 @@ def start_configured_run(
                 if reporter is not None:
                     reporter.publish(frame, "gameplay")
                 if allow_active or run_start_clicked:
-                    print("ready: configured Gennaro / Inlaid Library run is active", flush=True)
+                    print("ready: configured Poe / Inlaid Library run is active", flush=True)
                     return
                 raise RuntimeError(
                     "Gameplay is already active. Start the new run from the title menu "
@@ -312,16 +314,16 @@ def start_configured_run(
                 continue
             elif "characterselection" in screen:
                 if not character_clicked:
-                    if click_ocr_label(bridge, frame, "Gennaro", (.645, .28), (screen_text, screen_lines)):
+                    if click_ocr_label(bridge, frame, "Poe", ocr=(screen_text, screen_lines)):
                         character_clicked = True
-                        message = "selection: chose Gennaro"
+                        message = "selection: chose Poe"
                     else:
-                        message = "selection: waiting for the Gennaro card"
+                        message = "selection: waiting for the Poe card"
                 elif not character_confirmed:
                     if not click_ocr_label(bridge, frame, "Confirm", (.824, .93), (screen_text, screen_lines)):
                         bridge.click_client(.824, .93)
                     character_confirmed = True
-                    message = "selection: confirmed Gennaro"
+                    message = "selection: confirmed Poe"
                 elif not library_clicked:
                     if not stage_checkbox_checked(frame, "Inlaid Library"):
                         bridge.click_client(.752, .261)
@@ -342,7 +344,7 @@ def start_configured_run(
                     if not start_button_clicked:
                         bridge.click_client(.824, .93)
                     run_start_clicked = True
-                    message = "selection: starting Gennaro in Inlaid Library"
+                    message = "selection: starting Poe in Inlaid Library"
             elif "stageselection" in screen:
                 if not library_clicked:
                     if click_ocr_label(bridge, frame, "Inlaid Library", (.365, .417), (screen_text, screen_lines)):
@@ -578,7 +580,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--control", action="store_true", help="allow movement input")
     parser.add_argument("--full-run", action="store_true",
-                        help="select Gennaro and Inlaid Library, learn, and restart after death")
+                        help="select Poe and Inlaid Library, learn, and restart after death")
     parser.add_argument("--attach", action="store_true",
                         help="with --full-run, accept an already active run as the first run")
     parser.add_argument("--deep-learning", action="store_true",
@@ -1060,7 +1062,7 @@ def main() -> None:
                     if args.max_runs and completed_runs >= args.max_runs:
                         print(f"run-limit: completed {completed_runs} runs", flush=True)
                         break
-                    print(f"run-restart: completed={completed_runs}; preparing next Gennaro / Inlaid Library run", flush=True)
+                    print(f"run-restart: completed={completed_runs}; preparing next Poe / Inlaid Library run", flush=True)
                     return_to_title_after_death(
                         bridge, args.focus_timeout, reporter=screen_reporter,
                     )
