@@ -1,4 +1,3 @@
-Attempting to perform the InitializeDefaultDrives operation on the 'FileSystem' provider failed.
 # Running the learner in a Linux Mint VM
 
 ## What must run inside the VM

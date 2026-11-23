@@ -1,4 +1,3 @@
-Attempting to perform the InitializeDefaultDrives operation on the 'FileSystem' provider failed.
 # Vampire Survivors Trainer
 
 A local, vision-based Python trainer for Vampire Survivors. It controls the
