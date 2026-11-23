@@ -204,7 +204,7 @@ def start_configured_run(
     bridge: VampireSurvivorsBridge, timeout: float, *, allow_active: bool = False,
     reporter: ScreenStatusReporter | None = None, first_launch: bool = False,
 ) -> None:
-    """Navigate title → Poe → Inlaid Library → gameplay, verifying each screen."""
+    """Navigate title → Poe → Mad Forest → gameplay, verifying each screen."""
     deadline = time.monotonic() + timeout
     title_start_clicked = False
     title_splash_clicked = False
@@ -214,8 +214,9 @@ def start_configured_run(
     run_start_clicked = False
     character_clicked = False
     character_confirmed = False
-    library_clicked = False
+    library_unchecked_clicked = False
     mad_forest_clicked = False
+    stage_clicked = False
     stage_start_clicked = False
     stage_start_last_attempt = 0.0
     last_message = None
@@ -241,8 +242,9 @@ def start_configured_run(
                     run_start_clicked = False
                     character_clicked = False
                     character_confirmed = False
-                    library_clicked = False
+                    library_unchecked_clicked = False
                     mad_forest_clicked = False
+                    stage_clicked = False
                     stage_start_clicked = False
                     last_message = None
                     continue
@@ -255,7 +257,7 @@ def start_configured_run(
                 if reporter is not None:
                     reporter.publish(frame, "gameplay")
                 if allow_active or run_start_clicked:
-                    print("ready: configured Poe / Inlaid Library run is active", flush=True)
+                    print("ready: configured Poe / Mad Forest run is active", flush=True)
                     return
                 raise RuntimeError(
                     "Gameplay is already active. Start the new run from the title menu "
@@ -307,8 +309,9 @@ def start_configured_run(
                 run_start_clicked = False
                 character_clicked = False
                 character_confirmed = False
-                library_clicked = False
+                library_unchecked_clicked = False
                 mad_forest_clicked = False
+                stage_clicked = False
                 stage_start_clicked = False
                 last_message = None
                 continue
@@ -324,19 +327,20 @@ def start_configured_run(
                         bridge.click_client(.824, .93)
                     character_confirmed = True
                     message = "selection: confirmed Poe"
-                elif not library_clicked:
-                    if not stage_checkbox_checked(frame, "Inlaid Library"):
-                        bridge.click_client(.752, .261)
-                        library_clicked = True
-                        message = "selection: clicked Inlaid Library checkbox"
+                elif not stage_checkbox_checked(frame, "Mad Forest"):
+                    if not mad_forest_clicked:
+                        bridge.click_client(.752, .228)
+                        mad_forest_clicked = True
+                        message = "selection: clicked Mad Forest checkbox"
                     else:
-                        library_clicked = True
-                        message = "selection: Inlaid Library checked"
-                elif (not mad_forest_clicked
-                      and stage_checkbox_checked(frame, "Mad Forest")):
-                    bridge.click_client(.752, .228)
-                    mad_forest_clicked = True
-                    message = "selection: unchecked Mad Forest"
+                        message = "selection: waiting for Mad Forest to be selected"
+                elif stage_checkbox_checked(frame, "Inlaid Library"):
+                    if not library_unchecked_clicked:
+                        bridge.click_client(.752, .260)
+                        library_unchecked_clicked = True
+                        message = "selection: unchecked Inlaid Library"
+                    else:
+                        message = "selection: waiting for Inlaid Library to clear"
                 else:
                     start_button_clicked = click_ocr_label(
                         bridge, frame, "Start", (.824, .93), (screen_text, screen_lines),
@@ -344,14 +348,14 @@ def start_configured_run(
                     if not start_button_clicked:
                         bridge.click_client(.824, .93)
                     run_start_clicked = True
-                    message = "selection: starting Poe in Inlaid Library"
+                    message = "selection: starting Poe in Mad Forest"
             elif "stageselection" in screen:
-                if not library_clicked:
-                    if click_ocr_label(bridge, frame, "Inlaid Library", (.365, .417), (screen_text, screen_lines)):
-                        library_clicked = True
-                        message = "selection: chose Inlaid Library"
+                if not stage_clicked:
+                    if click_ocr_label(bridge, frame, "Mad Forest", ocr=(screen_text, screen_lines)):
+                        stage_clicked = True
+                        message = "selection: chose Mad Forest"
                     else:
-                        message = "selection: waiting for Inlaid Library"
+                        message = "selection: waiting for Mad Forest"
                 elif not stage_start_clicked:
                     # The Start label is sometimes omitted by Windows OCR on
                     # this busy stage screen; use the calibrated button point.
@@ -359,14 +363,14 @@ def start_configured_run(
                     stage_start_clicked = True
                     stage_start_last_attempt = time.monotonic()
                     run_start_clicked = True
-                    message = "selection: starting Inlaid Library"
+                    message = "selection: starting Mad Forest"
                 elif time.monotonic() - stage_start_last_attempt >= 2.0:
                     # Retry if the menu did not accept the first click.
                     bridge.click_client(.824, .93)
                     stage_start_last_attempt = time.monotonic()
-                    message = "selection: retrying Inlaid Library Start"
+                    message = "selection: retrying Mad Forest Start"
                 else:
-                    message = "selection: waiting for Inlaid Library to start"
+                    message = "selection: waiting for Mad Forest to start"
             elif (
                 title_splash_clicked
                 or "firstsurvivaton" in screen
@@ -580,7 +584,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--control", action="store_true", help="allow movement input")
     parser.add_argument("--full-run", action="store_true",
-                        help="select Poe and Inlaid Library, learn, and restart after death")
+                        help="select Poe and Mad Forest, learn, and restart after death")
     parser.add_argument("--attach", action="store_true",
                         help="with --full-run, accept an already active run as the first run")
     parser.add_argument("--deep-learning", action="store_true",
@@ -1062,7 +1066,7 @@ def main() -> None:
                     if args.max_runs and completed_runs >= args.max_runs:
                         print(f"run-limit: completed {completed_runs} runs", flush=True)
                         break
-                    print(f"run-restart: completed={completed_runs}; preparing next Poe / Inlaid Library run", flush=True)
+                    print(f"run-restart: completed={completed_runs}; preparing next Poe / Mad Forest run", flush=True)
                     return_to_title_after_death(
                         bridge, args.focus_timeout, reporter=screen_reporter,
                     )
