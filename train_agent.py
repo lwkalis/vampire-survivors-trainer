@@ -29,8 +29,8 @@ from upgrade_policy import (
 DATA_PATH = Path(__file__).parent / "data" / "vision_policy.json"
 MENU_POLL_INTERVAL = .15
 MENU_POST_CLICK_DELAY = .30
-SCREEN_HEARTBEAT_INTERVAL = 2.0
-SCREEN_PREVIEW_INTERVAL = 3.0
+SCREEN_HEARTBEAT_INTERVAL = 1.0
+SCREEN_PREVIEW_INTERVAL = 0.5
 UNKNOWN_SCREEN_OCR_INTERVAL = 5.0
 
 
@@ -355,7 +355,11 @@ def start_configured_run(
                         stage_clicked = True
                         message = "selection: chose Mad Forest"
                     else:
-                        message = "selection: waiting for Mad Forest"
+                        # Mad Forest is the first stage card. Its title is small
+                        # and OCR often misses it on this screen.
+                        bridge.click_client(.365, .255)
+                        stage_clicked = True
+                        message = "selection: clicked the Mad Forest card"
                 elif not stage_start_clicked:
                     # The Start label is sometimes omitted by Windows OCR on
                     # this busy stage screen; use the calibrated button point.

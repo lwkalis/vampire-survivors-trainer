@@ -14,7 +14,8 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#101820;border:1px so
 .notice{color:var(--muted);font-size:.88rem}#message{min-height:1.5em;color:var(--warn)}
 .alert{margin-top:14px;padding:12px 14px;border:1px solid #9b6a2d;border-radius:10px;background:#322616;color:#ffdc9e}.alert[hidden]{display:none}
 .preview-grid{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(220px,1fr);gap:12px;margin-top:16px}.preview-grid .metric{min-width:0}
-#preview{display:block;width:100%;max-height:420px;object-fit:contain;background:#080b10;border-radius:8px;margin-top:8px}#preview[hidden]{display:none}
+.feed-status{float:right;color:var(--accent);font-weight:700;font-size:.75rem}.feed-status.stale{color:var(--warn)}
+#preview{display:block;width:100%;max-height:560px;object-fit:contain;background:#080b10;border-radius:8px;margin-top:8px}#preview[hidden]{display:none}
 @media(max-width:640px){.preview-grid{grid-template-columns:1fr}}
 </style></head><body><main>
 <div class="top"><div><div class="eyebrow">Local network trainer</div><h1>Vampire Survivors</h1><div class="meta">Live training status</div></div><div class="topright"><div id="badge" class="status">Checking…</div><div id="gamebadge" class="status">Game status unknown</div></div></div>
@@ -36,20 +37,43 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#101820;border:1px so
 <progress id="xpbar" max="1" value="0"></progress><p class="notice">Game must be open in this VM. The trainer selects Poe and Mad Forest and restarts after Game Over.</p>
 <div id="stall" class="alert" role="status" aria-live="polite" hidden></div>
 <div class="preview-grid">
-<div class="metric"><div class="label">Latest game screen</div><img id="preview" alt="Latest Vampire Survivors screen" hidden><div id="previewUnavailable" class="meta">No screen preview yet.</div><div id="previewTime" class="meta"></div></div>
+<div class="metric"><div class="label">Live gameplay <span id="feedStatus" class="feed-status">CONNECTING</span></div><img id="preview" alt="Live Vampire Survivors gameplay" hidden><div id="previewUnavailable" class="meta">Waiting for live gameplay frames…</div><div id="previewTime" class="meta"></div></div>
 <div class="metric"><div class="label">Recognized text</div><pre id="screenText">No screen text reported yet.</pre></div>
 </div>
 <div class="label" style="margin-top:18px">Most recent training event</div><pre id="detail">Waiting for the first training report.</pre></section></main>
 <script>
 const el=id=>document.getElementById(id);
-let lastPreviewVersion="";
 const menuPhases=new Set(["photosensitivity-warning","title-splash","title-menu","character-selection","stage-selection","results-screen","upgrade-menu","treasure-reward","game-over","pause-menu"]);
 function duration(seconds){if(!Number.isFinite(seconds))return "—";const n=Math.max(0,Math.floor(seconds));return Math.floor(n/60)+":"+String(n%60).padStart(2,"0")}
 function ageSeconds(timestamp){const parsed=Date.parse(timestamp||"");return Number.isFinite(parsed)?Math.max(0,(Date.now()-parsed)/1000):null}
 function ageLabel(seconds){return seconds===null?"—":seconds<60?Math.floor(seconds)+"s ago":duration(seconds)+" ago"}
 function phaseLabel(phase){const labels={"starting":"Preparing trainer","photosensitivity-warning":"Photosensitivity warning","title-splash":"Title splash","title-menu":"Title menu","character-selection":"Character selection","stage-selection":"Stage selection","results-screen":"Results screen","upgrade-menu":"Upgrade menu","treasure-reward":"Treasure reward","game-over":"Game Over","pause-menu":"Pause menu","gameplay":"Gameplay","unknown-screen":"Unknown screen","focus-required":"Waiting for game focus"};return labels[phase]||"Waiting for screen status"}
-function updateDiagnostics(s,d){const phase=d.phase||"";const phaseAge=ageSeconds(d.phase_since);const heartbeatAge=ageSeconds(d.timestamp);el("phase").textContent=phaseLabel(phase);el("phaseAge").textContent=phaseAge===null?"—":duration(phaseAge);el("heartbeat").textContent=ageLabel(heartbeatAge);el("screenText").textContent=d.screen_text||"No OCR text recognized on the latest screen.";el("previewTime").textContent=d.screen_preview_updated_at?"Captured "+ageLabel(ageSeconds(d.screen_preview_updated_at)):"";let message="";if(s.trainer_running&&heartbeatAge!==null&&heartbeatAge>15)message="Screen heartbeat is stale. The trainer may be blocked or unresponsive.";else if(s.trainer_running&&phase==="unknown-screen"&&phaseAge!==null&&phaseAge>=10)message="The screen has been unrecognized for "+duration(phaseAge)+". Check the preview and recognized text.";else if(s.trainer_running&&menuPhases.has(phase)&&phaseAge!==null&&phaseAge>=20)message=phaseLabel(phase)+" has not changed for "+duration(phaseAge)+". Check the preview and recognized text.";el("stall").textContent=message;el("stall").hidden=!message;if(d.screen_preview_updated_at&&d.screen_preview_updated_at!==lastPreviewVersion){const img=el("preview");img.onload=()=>{img.hidden=false;el("previewUnavailable").hidden=true};img.onerror=()=>{img.hidden=true;el("previewUnavailable").hidden=false;el("previewUnavailable").textContent="Screen preview is unavailable."};img.src="/api/screen-preview?v="+encodeURIComponent(d.screen_preview_updated_at);lastPreviewVersion=d.screen_preview_updated_at}}
+function updateDiagnostics(s,d){
+ const phase=d.phase||"";
+ const phaseAge=ageSeconds(d.phase_since);
+ const heartbeatAge=ageSeconds(d.timestamp);
+ const previewAge=ageSeconds(d.screen_preview_updated_at);
+ el("phase").textContent=phaseLabel(phase);
+ el("phaseAge").textContent=phaseAge===null?"—":duration(phaseAge);
+ el("heartbeat").textContent=ageLabel(heartbeatAge);
+ el("screenText").textContent=d.screen_text||"No OCR text recognized on the latest screen.";
+ el("previewTime").textContent=previewAge===null?"Waiting for the first game frame":"Latest frame "+ageLabel(previewAge);
+ const feed=el("feedStatus");
+ feed.textContent=previewAge===null?"CONNECTING":previewAge<4?"LIVE":"STALE";
+ feed.classList.toggle("stale",previewAge!==null&&previewAge>=4);
+ let message="";
+ if(s.trainer_running&&heartbeatAge!==null&&heartbeatAge>15)message="Screen heartbeat is stale. The trainer may be blocked or unresponsive.";
+ else if(s.trainer_running&&phase==="unknown-screen"&&phaseAge!==null&&phaseAge>=10)message="The screen has been unrecognized for "+duration(phaseAge)+". Check the preview and recognized text.";
+ else if(s.trainer_running&&menuPhases.has(phase)&&phaseAge!==null&&phaseAge>=20)message=phaseLabel(phase)+" has not changed for "+duration(phaseAge)+". Check the preview and recognized text.";
+ el("stall").textContent=message;
+ el("stall").hidden=!message
+}
+const preview=el("preview");
+preview.onload=()=>{preview.hidden=false;el("previewUnavailable").hidden=true};
+preview.onerror=()=>{preview.hidden=true;el("previewUnavailable").hidden=false;el("previewUnavailable").textContent="Live screen stream is unavailable.";el("feedStatus").textContent="UNAVAILABLE"};
+preview.src="/api/screen-stream";
+
 async function refresh(){try{const response=await fetch("/api/status",{cache:"no-store"});const s=await response.json();el("badge").textContent=s.trainer_running?"Trainer running":s.latest?"Trainer stopped":"Waiting for trainer";el("badge").classList.toggle("live",s.trainer_running);el("gamebadge").textContent=s.game_running?"Game running":"Game not running";el("gamebadge").classList.toggle("live",s.game_running);el("launch").disabled=s.game_running;el("quit").disabled=!s.game_running;el("longest").textContent=duration(s.maximum_run_seconds);el("start").disabled=s.trainer_running;el("stop").disabled=!s.trainer_running;const r=s.latest||{};el("elapsed").textContent=duration(r.elapsed_seconds);el("runs").textContent=r.completed_runs||0;el("kills").textContent=r.kills??"—";el("xptext").textContent=Number.isFinite(r.xp_fill)?Math.round(r.xp_fill*100)+"%":"—";el("xpbar").value=Number.isFinite(r.xp_fill)?Math.max(0,Math.min(1,r.xp_fill)):0;el("health").textContent=Number.isFinite(r.health_fill)?Math.round(r.health_fill*100)+"%":"—";el("action").textContent=r.action||r.state||"—";el("reward").textContent=Number.isFinite(r.total_reward)?r.total_reward.toFixed(2):"—";el("updates").textContent=r.dqn_updates??"—";el("detail").textContent=r.timestamp?JSON.stringify(r,null,2):"Waiting for the first training report.";updateDiagnostics(s,s.diagnostic||{})}catch(e){el("badge").textContent="Status service unavailable"}}
 async function control(route){if(route==="/api/start"&&!confirm("Start Vampire Survivors training on this VM?"))return;if(route==="/api/launch"&&!confirm("Launch Vampire Survivors through Steam on this VM?"))return;if(route==="/api/quit-game"&&!confirm("Quit Vampire Survivors now? The game will receive a normal close request."))return;el("message").textContent="Sending request…";try{const r=await fetch(route,{method:"POST"});const d=await r.json();el("message").textContent=d.message||d.error||"Done";await refresh()}catch(e){el("message").textContent="Request failed"}}
-el("launch").onclick=()=>control("/api/launch");el("start").onclick=()=>control("/api/start");el("stop").onclick=()=>control("/api/stop");el("quit").onclick=()=>control("/api/quit-game");refresh();setInterval(refresh,2000);
+el("launch").onclick=()=>control("/api/launch");el("start").onclick=()=>control("/api/start");el("stop").onclick=()=>control("/api/stop");el("quit").onclick=()=>control("/api/quit-game");refresh();setInterval(refresh,1000);
 </script></body></html>

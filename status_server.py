@@ -9,6 +9,7 @@ import signal
 import shutil
 import subprocess
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -232,6 +233,32 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(payload)
             return
+        if route == "/api/screen-stream":
+            preview = self.report_path.with_name("current-screen.jpg")
+            self.send_response(200)
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            last_mtime = None
+            while True:
+                try:
+                    mtime = preview.stat().st_mtime_ns
+                    if mtime != last_mtime:
+                        payload = preview.read_bytes()
+                        part = (
+                            b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                            + str(len(payload)).encode("ascii")
+                            + b"\r\n\r\n" + payload + b"\r\n"
+                        )
+                        self.wfile.write(part)
+                        self.wfile.flush()
+                        last_mtime = mtime
+                    time.sleep(.1)
+                except FileNotFoundError:
+                    time.sleep(.2)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    return
         if route == "/api/screen-preview":
             try:
                 payload = self.report_path.with_name("current-screen.jpg").read_bytes()

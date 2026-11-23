@@ -4,8 +4,8 @@ A local, vision-based Python trainer for Vampire Survivors. It controls the
 visible game window, collects XP gems, avoids threats, chooses upgrades across
 the standard level-up menu, a six-card themed choice, and the four-column
 Weapon Selection screen, and learns movement with a small visual DQN. Training
-progress can be viewed from a LAN dashboard. Full-run mode selects Poe and
-Mad Forest, then starts another run after Game Over.
+progress can be viewed from a LAN dashboard with a live gameplay feed.
+Full-run mode selects Poe and Mad Forest, then starts another run after Game Over.
 
 ## Requirements
 
