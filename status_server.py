@@ -79,21 +79,34 @@ def launch_game() -> tuple[bool, str]:
             return False, f"Could not start Steam: {exc}"
     return True, "Steam was asked to launch Vampire Survivors. The game may take a moment to open."
 
-def latest_report(path: Path) -> dict | None:
+def _recent_report_records(path: Path) -> list[dict]:
     try:
         with path.open("rb") as stream:
             stream.seek(0, os.SEEK_END)
             end = stream.tell()
-            stream.seek(max(0, end - 16384))
+            stream.seek(max(0, end - 65536))
             lines = stream.read().splitlines()
     except OSError:
-        return None
+        return []
+    records = []
     for line in reversed(lines):
         try:
-            record = json.loads(line)
+            records.append(json.loads(line))
         except (UnicodeDecodeError, json.JSONDecodeError):
             continue
+    return records
+
+
+def latest_report(path: Path) -> dict | None:
+    for record in _recent_report_records(path):
         if record.get("event") in {"progress", "run_completed", "run_started", "session_stopped"}:
+            return record
+    return None
+
+
+def latest_screen_status(path: Path) -> dict | None:
+    for record in _recent_report_records(path):
+        if record.get("event") == "screen_status":
             return record
     return None
 
@@ -209,12 +222,26 @@ class Handler(BaseHTTPRequestHandler):
                 "trainer_running": trainer_pid() is not None,
                 "game_running": game_running(),
                 "latest": latest_report(self.report_path),
+                "diagnostic": latest_screen_status(self.report_path),
                 "maximum_run_seconds": maximum_completed_run(self.report_path),
                 "report_path": str(self.report_path),
             }).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        if route == "/api/screen-preview":
+            try:
+                payload = self.report_path.with_name("current-screen.jpg").read_bytes()
+            except OSError:
+                self.send_error(404, "Screen preview is not available yet")
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)
             return

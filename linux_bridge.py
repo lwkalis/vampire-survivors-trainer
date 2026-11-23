@@ -124,8 +124,8 @@ class VampireSurvivorsBridge:
         py = round(min(max(float(y), 0.0), 1.0) * geometry["height"])
         # A repeated click may target the current cursor position.
         self._run("xdotool", "mousemove", "--window", self.window_id,
-                  str(px), str(py), "sleep", "0.12",
-                  "mousedown", "1", "sleep", "0.12", "mouseup", "1")
+                  str(px), str(py), "sleep", "0.04",
+                  "mousedown", "1", "sleep", "0.06", "mouseup", "1")
 
     def key_down(self, direction: str) -> bool:
         """Return whether this bridge currently holds the requested movement key."""

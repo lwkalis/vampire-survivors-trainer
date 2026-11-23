@@ -27,6 +27,11 @@ from upgrade_policy import (
 
 
 DATA_PATH = Path(__file__).parent / "data" / "vision_policy.json"
+MENU_POLL_INTERVAL = .15
+MENU_POST_CLICK_DELAY = .30
+SCREEN_HEARTBEAT_INTERVAL = 2.0
+SCREEN_PREVIEW_INTERVAL = 3.0
+UNKNOWN_SCREEN_OCR_INTERVAL = 5.0
 
 
 def write_progress_report(path: Path | None, event: str, **fields: object) -> None:
@@ -39,6 +44,64 @@ def write_progress_report(path: Path | None, event: str, **fields: object) -> No
     }
     with path.open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n")
+
+
+def write_current_screen(path: Path | None, frame) -> str | None:
+    """Atomically update the dashboard's local game-screen preview."""
+    if path is None or frame is None:
+        return None
+    preview = path.with_name("current-screen.jpg")
+    temporary = path.with_name("current-screen.tmp.jpg")
+    try:
+        if not cv2.imwrite(str(temporary), frame, [cv2.IMWRITE_JPEG_QUALITY, 75]):
+            return None
+        temporary.replace(preview)
+    except (OSError, cv2.error):
+        return None
+    return datetime.now(timezone.utc).isoformat()
+
+
+class ScreenStatusReporter:
+    """Publish a low-rate screen heartbeat and a throttled current-frame preview."""
+
+    def __init__(self, report_path: Path | None) -> None:
+        self.report_path = report_path
+        self.phase: str | None = None
+        self.phase_started = 0.0
+        self.phase_since: str | None = None
+        self.last_heartbeat = 0.0
+        self.last_preview = 0.0
+        self.preview_updated_at: str | None = None
+        self.screen_text = ""
+
+    def publish(self, frame, phase: str, *, screen_text: str | None = None) -> None:
+        if self.report_path is None:
+            return
+        now = time.monotonic()
+        changed = phase != self.phase
+        if changed:
+            self.phase = phase
+            self.phase_started = now
+            self.phase_since = datetime.now(timezone.utc).isoformat()
+            self.screen_text = ""
+        if screen_text is not None:
+            cleaned = " ".join(screen_text.split())
+            if cleaned:
+                self.screen_text = cleaned[:800]
+        if frame is not None and (changed or now - self.last_preview >= SCREEN_PREVIEW_INTERVAL):
+            updated_at = write_current_screen(self.report_path, frame)
+            if updated_at is not None:
+                self.preview_updated_at = updated_at
+            self.last_preview = now
+        if changed or now - self.last_heartbeat >= SCREEN_HEARTBEAT_INTERVAL:
+            write_progress_report(
+                self.report_path, "screen_status", phase=phase,
+                phase_since=self.phase_since,
+                phase_duration_seconds=round(now - self.phase_started, 1),
+                screen_text=self.screen_text,
+                screen_preview_updated_at=self.preview_updated_at,
+            )
+            self.last_heartbeat = now
 
 
 def load_stats() -> tuple[list[int], list[float]]:
@@ -67,6 +130,22 @@ def save_stats(counts: list[int], means: list[float]) -> None:
 
 def _label_key(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", text.casefold())
+
+
+def startup_screen_phase(screen: str) -> str:
+    if "photosensitivitywarning" in screen:
+        return "photosensitivity-warning"
+    if "gameover" in screen:
+        return "game-over"
+    if "characterselection" in screen:
+        return "character-selection"
+    if "stageselection" in screen:
+        return "stage-selection"
+    if "firstsurvivaton" in screen:
+        return "title-splash"
+    if "quickstart" in screen or "vampiresurvivors" in screen:
+        return "title-menu"
+    return "unknown-screen"
 
 
 def click_ocr_label(
@@ -121,6 +200,7 @@ def stage_checkbox_checked(frame, stage: str) -> bool:
 
 def start_configured_run(
     bridge: VampireSurvivorsBridge, timeout: float, *, allow_active: bool = False,
+    reporter: ScreenStatusReporter | None = None,
 ) -> None:
     """Navigate title → Gennaro → Inlaid Library → gameplay, verifying each screen."""
     deadline = time.monotonic() + timeout
@@ -137,6 +217,8 @@ def start_configured_run(
     while time.monotonic() < deadline:
         if not bridge.is_foreground():
             message = "focus-required: click Vampire Survivors; waiting without input"
+            if reporter is not None:
+                reporter.publish(None, "focus-required")
         else:
             frame = bridge.capture()
             if ScreenSpaceDodge.game_over_visible(frame):
@@ -144,8 +226,10 @@ def start_configured_run(
                 if ("gameover" in screen
                         or ("over" in screen and "quit" in screen)):
                     print("startup: Game Over found; returning to title", flush=True)
+                    if reporter is not None:
+                        reporter.publish(frame, "game-over", screen_text=screen)
                     remaining = max(.1, deadline - time.monotonic())
-                    return_to_title_after_death(bridge, remaining)
+                    return_to_title_after_death(bridge, remaining, reporter=reporter)
                     title_start_clicked = False
                     title_splash_clicked = False
                     run_start_clicked = False
@@ -157,9 +241,13 @@ def start_configured_run(
                     last_message = None
                     continue
             if level_up_visible(frame):
+                if reporter is not None:
+                    reporter.publish(frame, "upgrade-menu")
                 print("startup: open upgrade choice found; resuming the active run", flush=True)
                 return
             if gameplay_hud_visible(frame):
+                if reporter is not None:
+                    reporter.publish(frame, "gameplay")
                 if allow_active or run_start_clicked:
                     print("ready: configured Gennaro / Inlaid Library run is active", flush=True)
                     return
@@ -175,6 +263,8 @@ def start_configured_run(
             if not any(label in screen for label in startup_labels):
                 screen_text, screen_lines = read_screen_ocr(frame, white_text=True)
                 screen = _label_key(screen_text)
+            if reporter is not None:
+                reporter.publish(frame, startup_screen_phase(screen), screen_text=screen_text)
             if ("photosensitivity" in screen and "warning" in screen
                     and ("presstostart" in screen or "start" in screen)):
                 # The first-launch disclaimer is a separate screen from the
@@ -182,12 +272,12 @@ def start_configured_run(
                 # center of the game client (about 82% down the frame).
                 bridge.click_client(.50, .82)
                 message = "startup: acknowledged the photosensitivity warning"
-                time.sleep(.45)
+                time.sleep(MENU_POST_CLICK_DELAY)
                 continue
             if "gameover" in screen:
                 print("startup: Game Over detected in OCR; returning to title", flush=True)
                 remaining = max(.1, deadline - time.monotonic())
-                return_to_title_after_death(bridge, remaining)
+                return_to_title_after_death(bridge, remaining, reporter=reporter)
                 title_start_clicked = False
                 title_splash_clicked = False
                 run_start_clicked = False
@@ -273,7 +363,7 @@ def start_configured_run(
         if message != last_message:
             print(message, flush=True)
             last_message = message
-        time.sleep(.35)
+        time.sleep(MENU_POLL_INTERVAL)
     bridge.release_all()
     raise RuntimeError(
         f"The configured run did not reach gameplay within {timeout:g}s. "
@@ -283,6 +373,7 @@ def start_configured_run(
 
 def return_to_title_after_death(
     bridge: VampireSurvivorsBridge, timeout: float,
+    *, reporter: ScreenStatusReporter | None = None,
 ) -> None:
     """Exit a dead run through Quit, using a revive only to reach run options."""
     deadline = time.monotonic() + timeout
@@ -296,6 +387,8 @@ def return_to_title_after_death(
     while time.monotonic() < deadline:
         if not bridge.is_foreground():
             message = "restart: focus the game; waiting without input"
+            if reporter is not None:
+                reporter.publish(None, "focus-required")
         else:
             frame = bridge.capture()
             text, lines = read_screen_ocr(frame)
@@ -307,23 +400,32 @@ def return_to_title_after_death(
                 screen = _label_key(text)
             ocr = (text, lines)
             if "characterselection" in screen or "stageselection" in screen:
+                phase = "character-selection" if "characterselection" in screen else "stage-selection"
+                if reporter is not None:
+                    reporter.publish(frame, phase, screen_text=text)
                 print("restart: reached selection for the next run", flush=True)
                 return
             if ("quickstart" in screen
                     or ("vampiresurvivors" in screen and "start" in screen
                         and not ScreenSpaceDodge.game_over_visible(frame))):
+                if reporter is not None:
+                    reporter.publish(frame, "title-menu", screen_text=text)
                 print("restart: returned to title menu", flush=True)
                 return
             if "survived" in screen and ("done" in screen or "results" in screen):
+                if reporter is not None:
+                    reporter.publish(frame, "results-screen", screen_text=text)
                 if click_ocr_label(bridge, frame, "Done", (.50, .935), ocr):
                     message = "restart: closed the Results screen"
                 else:
                     bridge.click_client(.50, .935)
                     message = "restart: closing the Results screen"
                 print(message, flush=True)
-                time.sleep(.5)
+                time.sleep(MENU_POST_CLICK_DELAY)
                 continue
             if "firstsurvivaton" in screen:
+                if reporter is not None:
+                    reporter.publish(frame, "title-splash", screen_text=text)
                 height, width = frame.shape[:2]
                 start_button = frame[round(.618 * height):round(.685 * height),
                                      round(.423 * width):round(.577 * width)]
@@ -335,12 +437,23 @@ def return_to_title_after_death(
                     bridge.click_client(.50, .65)
                     splash_clicked = True
                     print("restart: advancing past the title splash", flush=True)
-                    time.sleep(.5)
+                    time.sleep(MENU_POST_CLICK_DELAY)
                     continue
             pause_visible = pause_menu_visible(frame)
             over_heading = ""
             if ScreenSpaceDodge.game_over_visible(frame):
                 over_heading = _label_key(read_game_over_heading(frame))
+            if reporter is not None:
+                if gameplay_hud_visible(frame):
+                    phase = "gameplay"
+                elif pause_visible:
+                    phase = "pause-menu"
+                elif ("gameover" in over_heading or "gameover" in screen
+                      or ("over" in screen and "quit" in screen)):
+                    phase = "game-over"
+                else:
+                    phase = "unknown-screen"
+                reporter.publish(frame, phase, screen_text=text)
             if (("gameover" in over_heading or "gameover" in screen
                  or ("over" in screen and "quit" in screen))
                     and not (escape_tried and pause_visible)):
@@ -422,7 +535,7 @@ def return_to_title_after_death(
         if message != last_message:
             print(message, flush=True)
             last_message = message
-        time.sleep(.4)
+        time.sleep(MENU_POLL_INTERVAL)
     bridge.release_all()
     raise RuntimeError(
         f"Could not return to the title menu within {timeout:g}s after Game Over."
@@ -472,6 +585,8 @@ def main() -> None:
     if args.report_path:
         args.report_path.parent.mkdir(parents=True, exist_ok=True)
 
+    screen_reporter = ScreenStatusReporter(args.report_path)
+    screen_reporter.publish(None, "starting")
     bridge = VampireSurvivorsBridge()
     dqn = None
     dqn_state = None
@@ -567,8 +682,13 @@ def main() -> None:
             if (confirmed_game_over(initial_frame)
                     or ("survived" in initial_text and ("done" in initial_text or "results" in initial_text))):
                 print("startup: post-run screen found; returning to title before a fresh run", flush=True)
-                return_to_title_after_death(bridge, args.focus_timeout)
-        start_configured_run(bridge, args.focus_timeout, allow_active=args.attach)
+                return_to_title_after_death(
+                    bridge, args.focus_timeout, reporter=screen_reporter,
+                )
+        start_configured_run(
+            bridge, args.focus_timeout, allow_active=args.attach,
+            reporter=screen_reporter,
+        )
     elif args.control:
         bridge.activate()  # Best effort; Windows may require a user click.
         ready_deadline = time.monotonic() + args.focus_timeout
@@ -583,6 +703,7 @@ def main() -> None:
                 )
             if not bridge.is_foreground():
                 message = "focus-required: click the Vampire Survivors window; waiting without sending keys"
+                screen_reporter.publish(None, "focus-required")
             else:
                 ready_frame = bridge.capture()
                 menu_text = read_screen_text(ready_frame).lower() if args.full_run else ""
@@ -634,7 +755,7 @@ def main() -> None:
                         bridge.click_client(click_x, click_y)
                         run_picks.append(chosen or f"Unknown card slot {choice_index + 1}")
                         run_levels += 1
-                        time.sleep(.45)
+                        time.sleep(MENU_POST_CLICK_DELAY)
                         level_text_checked_at = 0.0
                         level_state_cache = False
                         message = "upgrade-selected: waiting for active gameplay"
@@ -667,13 +788,33 @@ def main() -> None:
                         message = "menu-check: Quick Start not confirmed; no click sent"
                 else:
                     message = "waiting: looking for active gameplay; no movement sent"
+                if ready_level_up:
+                    ready_phase = "upgrade-menu"
+                elif ready_treasure_state is not None:
+                    ready_phase = "treasure-reward"
+                elif confirmed_game_over(ready_frame):
+                    ready_phase = "game-over"
+                elif pause_menu_visible(ready_frame):
+                    ready_phase = "pause-menu"
+                elif gameplay_hud_visible(ready_frame):
+                    ready_phase = "gameplay"
+                elif "quick start" in menu_text:
+                    ready_phase = "title-menu"
+                else:
+                    ready_phase = "unknown-screen"
+                screen_reporter.publish(
+                    ready_frame, ready_phase,
+                    screen_text=menu_text if menu_text else None,
+                )
             if message != waiting_message:
                 print(message, flush=True)
                 waiting_message = message
-            time.sleep(.20)
+            time.sleep(MENU_POLL_INTERVAL)
 
     start = previous_time = time.monotonic()
     next_evidence = 0.0
+    unknown_ocr_checked_at = 0.0
+    unknown_ocr_text = ""
     action = None
     last_state = None
     focus_lost_since: float | None = None
@@ -682,6 +823,7 @@ def main() -> None:
     try:
         while True:
             if args.control and not bridge.is_foreground():
+                screen_reporter.publish(None, "focus-required")
                 bridge.release_all()
                 action = None
                 if focus_lost_since is None:
@@ -730,6 +872,17 @@ def main() -> None:
             state = ("level-up" if level_up else "treasure" if treasure else
                      "game-over" if game_over else "paused" if paused else
                      "play" if active else "waiting")
+            phase = {
+                "level-up": "upgrade-menu", "treasure": "treasure-reward",
+                "game-over": "game-over", "paused": "pause-menu",
+                "play": "gameplay", "waiting": "unknown-screen",
+            }[state]
+            diagnostic_text = None
+            if state == "waiting" and now - unknown_ocr_checked_at >= UNKNOWN_SCREEN_OCR_INTERVAL:
+                unknown_ocr_text = read_screen_text(frame)
+                unknown_ocr_checked_at = now
+                diagnostic_text = unknown_ocr_text
+            screen_reporter.publish(frame, phase, screen_text=diagnostic_text)
             fill = xp_bar_fill(frame)
             chest_collected = chest_detector.update(frame, active=active)
             chest_collected = chest_collected or chest_prompt_event
@@ -876,7 +1029,9 @@ def main() -> None:
                         print(f"run-limit: completed {completed_runs} runs", flush=True)
                         break
                     print(f"run-restart: completed={completed_runs}; preparing next Gennaro / Inlaid Library run", flush=True)
-                    return_to_title_after_death(bridge, args.focus_timeout)
+                    return_to_title_after_death(
+                        bridge, args.focus_timeout, reporter=screen_reporter,
+                    )
                     run_id = uuid.uuid4().hex[:12]
                     write_progress_report(
                         args.report_path, "run_started", run_id=run_id,
@@ -906,7 +1061,9 @@ def main() -> None:
                     action = None
                     last_state = None
                     next_evidence = 0.0
-                    start_configured_run(bridge, args.focus_timeout)
+                    start_configured_run(
+                        bridge, args.focus_timeout, reporter=screen_reporter,
+                    )
                     start = previous_time = time.monotonic()
                     continue
                 break
@@ -925,7 +1082,7 @@ def main() -> None:
                 click_x, click_y = card_click_position(choice_index, frame)
                 bridge.click_client(click_x, click_y)
                 run_picks.append(chosen or f"Unknown card slot {choice_index + 1}")
-                time.sleep(.45)
+                time.sleep(MENU_POST_CLICK_DELAY)
                 level_text_checked_at = 0.0
                 level_state_cache = False
                 verify = bridge.capture()
