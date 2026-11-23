@@ -1,4 +1,4 @@
-"""LAN dashboard for live training progress with fixed start and stop controls."""
+"""LAN dashboard with live gameplay capture and training controls."""
 
 from __future__ import annotations
 import argparse
@@ -8,13 +8,17 @@ from pathlib import Path
 import signal
 import shutil
 import subprocess
+import sys
 import threading
 import time
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 ROOT = Path(__file__).parent.resolve()
 DEFAULT_REPORT = ROOT / "data" / "training-progress.jsonl"
+LIVE_PREVIEW_PATH = ROOT / "data" / "dashboard-live-screen.jpg"
+LIVE_PREVIEW_TEMP = ROOT / "data" / "dashboard-live-screen.tmp.jpg"
 PID_FILE = ROOT / "data" / "trainer.pid"
 LOG_FILE = ROOT / "data" / "trainer-console.log"
 HTML = (ROOT / "status.html").read_bytes()
@@ -111,6 +115,63 @@ def latest_screen_status(path: Path) -> dict | None:
             return record
     return None
 
+
+def newest_preview_path(report_path: Path) -> Path | None:
+    candidates = (LIVE_PREVIEW_PATH, report_path.with_name("current-screen.jpg"))
+    available: list[tuple[int, Path]] = []
+    for candidate in candidates:
+        try:
+            available.append((candidate.stat().st_mtime_ns, candidate))
+        except OSError:
+            continue
+    return max(available, default=(0, None), key=lambda item: item[0])[1]
+
+
+def preview_timestamp(report_path: Path) -> str | None:
+    path = newest_preview_path(report_path)
+    if path is None:
+        return None
+    try:
+        modified = path.stat().st_mtime
+    except OSError:
+        return None
+    return datetime.fromtimestamp(modified, timezone.utc).isoformat()
+
+
+def capture_live_screen() -> None:
+    """Capture the visible game independently of the trainer's slower reports."""
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        import cv2
+        from linux_bridge import VampireSurvivorsBridge
+    except Exception as exc:
+        print(f"Live screen capture unavailable: {exc}", flush=True)
+        return
+    LIVE_PREVIEW_PATH.parent.mkdir(parents=True, exist_ok=True)
+    bridge = None
+    while True:
+        try:
+            if bridge is None:
+                bridge = VampireSurvivorsBridge()
+            frame = bridge.capture()
+            height, width = frame.shape[:2]
+            if width > 960:
+                frame = cv2.resize(
+                    frame, (960, round(height * 960 / width)),
+                    interpolation=cv2.INTER_AREA,
+                )
+            if not cv2.imwrite(
+                str(LIVE_PREVIEW_TEMP), frame,
+                [cv2.IMWRITE_JPEG_QUALITY, 70],
+            ):
+                raise OSError("Could not encode the live game frame")
+            LIVE_PREVIEW_TEMP.replace(LIVE_PREVIEW_PATH)
+        except Exception:
+            bridge = None
+            time.sleep(.5)
+            continue
+        time.sleep(.25)
 
 def quit_game() -> tuple[bool, str]:
     """Ask the visible game window to close cleanly; never kill its process."""
@@ -219,11 +280,15 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(HTML)
             return
         if route == "/api/status":
+            diagnostic = latest_screen_status(self.report_path) or {}
+            live_timestamp = preview_timestamp(self.report_path)
+            if live_timestamp is not None:
+                diagnostic["screen_preview_updated_at"] = live_timestamp
             payload = json.dumps({
                 "trainer_running": trainer_pid() is not None,
                 "game_running": game_running(),
                 "latest": latest_report(self.report_path),
-                "diagnostic": latest_screen_status(self.report_path),
+                "diagnostic": diagnostic,
                 "maximum_run_seconds": maximum_completed_run(self.report_path),
                 "report_path": str(self.report_path),
             }).encode()
@@ -234,17 +299,21 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(payload)
             return
         if route == "/api/screen-stream":
-            preview = self.report_path.with_name("current-screen.jpg")
             self.send_response(200)
             self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Connection", "keep-alive")
             self.end_headers()
+            last_path = None
             last_mtime = None
             while True:
                 try:
+                    preview = newest_preview_path(self.report_path)
+                    if preview is None:
+                        time.sleep(.2)
+                        continue
                     mtime = preview.stat().st_mtime_ns
-                    if mtime != last_mtime:
+                    if preview != last_path or mtime != last_mtime:
                         payload = preview.read_bytes()
                         part = (
                             b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
@@ -253,15 +322,17 @@ class Handler(BaseHTTPRequestHandler):
                         )
                         self.wfile.write(part)
                         self.wfile.flush()
+                        last_path = preview
                         last_mtime = mtime
                     time.sleep(.1)
-                except FileNotFoundError:
-                    time.sleep(.2)
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     return
         if route == "/api/screen-preview":
             try:
-                payload = self.report_path.with_name("current-screen.jpg").read_bytes()
+                preview = newest_preview_path(self.report_path)
+                if preview is None:
+                    raise FileNotFoundError
+                payload = preview.read_bytes()
             except OSError:
                 self.send_error(404, "Screen preview is not available yet")
                 return
@@ -305,6 +376,7 @@ def main() -> None:
     parser.add_argument("--report-path", type=Path, default=DEFAULT_REPORT)
     args = parser.parse_args()
     Handler.report_path = args.report_path
+    threading.Thread(target=capture_live_screen, name="dashboard-live-screen", daemon=True).start()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"Dashboard listening on port {args.port}; report: {args.report_path}", flush=True)
     server.serve_forever()
