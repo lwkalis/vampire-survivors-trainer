@@ -200,6 +200,25 @@ def stage_checkbox_checked(frame, stage: str) -> bool:
     return bool(crop.size and float((crop.max(axis=2) > 175).mean()) > .06)
 
 
+def interested_page_visible(frame) -> bool:
+    """Recognize the optional DLC prompt by its centered heading."""
+    height, width = frame.shape[:2]
+    title = frame[
+        round(.105 * height):round(.22 * height),
+        round(.28 * width):round(.72 * width),
+    ]
+    if not title.size:
+        return False
+    enlarged = cv2.resize(title, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+    text, _ = read_screen_ocr(enlarged, white_text=True, page_mode=7)
+    normalized = _label_key(text)
+    if "interested" in normalized and "this" in normalized:
+        return True
+    text, _ = read_screen_ocr(enlarged, page_mode=7)
+    normalized = _label_key(text)
+    return "interested" in normalized and "this" in normalized
+
+
 def start_configured_run(
     bridge: VampireSurvivorsBridge, timeout: float, *, allow_active: bool = False,
     reporter: ScreenStatusReporter | None = None, first_launch: bool = False,
@@ -219,6 +238,8 @@ def start_configured_run(
     stage_clicked = False
     stage_start_clicked = False
     stage_start_last_attempt = 0.0
+    interested_check_last_attempt = 0.0
+    interested_back_last_attempt = 0.0
     last_message = None
     while time.monotonic() < deadline:
         if not bridge.is_foreground():
@@ -263,6 +284,24 @@ def start_configured_run(
                     "Gameplay is already active. Start the new run from the title menu "
                     "or use --attach to continue this run."
                 )
+            now = time.monotonic()
+            if now - interested_check_last_attempt >= 0.75:
+                interested_check_last_attempt = now
+                if interested_page_visible(frame):
+                    if reporter is not None:
+                        reporter.publish(frame, "promo-page", screen_text="Interested in this?")
+                    if now - interested_back_last_attempt >= 1.0:
+                        bridge.release_all()
+                        bridge.click_client(.50, .80)
+                        interested_back_last_attempt = now
+                        message = "promo-page: clicked Back"
+                    else:
+                        message = "promo-page: waiting for Back to close"
+                    if message != last_message:
+                        print(message, flush=True)
+                        last_message = message
+                    time.sleep(MENU_POLL_INTERVAL)
+                    continue
             screen_text, screen_lines = read_screen_ocr(frame)
             screen = _label_key(screen_text)
             startup_labels = ("characterselection", "stageselection", "firstsurvivaton",
@@ -425,6 +464,8 @@ def return_to_title_after_death(
     options_clicked = False
     quit_clicked = False
     splash_clicked = False
+    interested_check_last_attempt = 0.0
+    interested_back_last_attempt = 0.0
     last_message = None
     while time.monotonic() < deadline:
         if not bridge.is_foreground():
@@ -433,6 +474,24 @@ def return_to_title_after_death(
                 reporter.publish(None, "focus-required")
         else:
             frame = bridge.capture()
+            now = time.monotonic()
+            if now - interested_check_last_attempt >= 0.75:
+                interested_check_last_attempt = now
+                if interested_page_visible(frame):
+                    if reporter is not None:
+                        reporter.publish(frame, "promo-page", screen_text="Interested in this?")
+                    if now - interested_back_last_attempt >= 1.0:
+                        bridge.release_all()
+                        bridge.click_client(.50, .80)
+                        interested_back_last_attempt = now
+                        message = "promo-page: clicked Back"
+                    else:
+                        message = "promo-page: waiting for Back to close"
+                    if message != last_message:
+                        print(message, flush=True)
+                        last_message = message
+                    time.sleep(MENU_POLL_INTERVAL)
+                    continue
             text, lines = read_screen_ocr(frame)
             screen = _label_key(text)
             restart_labels = ("quickstart", "characterselection", "stageselection",
