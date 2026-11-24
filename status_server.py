@@ -21,11 +21,15 @@ LIVE_PREVIEW_PATH = ROOT / "data" / "dashboard-live-screen.jpg"
 LIVE_PREVIEW_TEMP = ROOT / "data" / "dashboard-live-screen.tmp.jpg"
 PID_FILE = ROOT / "data" / "trainer.pid"
 LOG_FILE = ROOT / "data" / "trainer-console.log"
+LONGEST_RESET_FILE = ROOT / "data" / "longest-run-reset.json"
+LONGEST_RESET_TEMP = ROOT / "data" / "longest-run-reset.tmp"
 HTML = (ROOT / "status.html").read_bytes()
 LOCK = threading.Lock()
 TRAINER: subprocess.Popen | None = None
 GAME_LAUNCH: subprocess.Popen | None = None
-REPORT_CACHE: dict[str, object] = {"path": None, "offset": 0, "maximum": 0.0}
+REPORT_CACHE: dict[str, object] = {
+    "path": None, "offset": 0, "maximum": 0.0, "reset_at": None,
+}
 REPORT_LOCK = threading.Lock()
 
 
@@ -202,15 +206,69 @@ def quit_game() -> tuple[bool, str]:
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, f"Could not request a clean close: {exc}"
 
+def _complete_report_offset(path: Path) -> int:
+    """Return a byte offset just after the last complete JSONL record."""
+    try:
+        size = path.stat().st_size
+        start = max(0, size - 65536)
+        with path.open("rb") as stream:
+            stream.seek(start)
+            tail = stream.read()
+    except OSError:
+        return 0
+    newline = tail.rfind(b"\n")
+    return start + newline + 1 if newline >= 0 else 0
+
+
+def reset_longest_run(path: Path) -> tuple[bool, str]:
+    """Reset the dashboard maximum without deleting training history."""
+    with REPORT_LOCK:
+        offset = _complete_report_offset(path)
+        reset_at = datetime.now(timezone.utc).isoformat()
+        marker = {
+            "report_path": str(path),
+            "offset": offset,
+            "reset_at": reset_at,
+        }
+        try:
+            LONGEST_RESET_FILE.parent.mkdir(parents=True, exist_ok=True)
+            LONGEST_RESET_TEMP.write_text(
+                json.dumps(marker, sort_keys=True), encoding="utf-8",
+            )
+            LONGEST_RESET_TEMP.replace(LONGEST_RESET_FILE)
+        except OSError as exc:
+            return False, f"Could not save longest-run reset: {exc}"
+        REPORT_CACHE.update(
+            path=str(path), offset=offset, maximum=0.0, reset_at=reset_at,
+        )
+    return True, "Longest run reset to 0:00. Completed run history was kept."
+
+
 def maximum_completed_run(path: Path) -> float:
-    """Incrementally track the longest recorded completed run in the JSONL log."""
+    """Incrementally track completed runs since the last dashboard reset."""
     try:
         size = path.stat().st_size
     except OSError:
         return float(REPORT_CACHE["maximum"])
     with REPORT_LOCK:
-        if REPORT_CACHE["path"] != str(path) or size < int(REPORT_CACHE["offset"]):
-            REPORT_CACHE.update(path=str(path), offset=0, maximum=0.0)
+        reset_at = None
+        reset_offset = 0
+        try:
+            marker = json.loads(LONGEST_RESET_FILE.read_text(encoding="utf-8"))
+            if marker.get("report_path") == str(path):
+                reset_at = marker.get("reset_at")
+                reset_offset = max(0, int(marker.get("offset", 0)))
+        except (OSError, ValueError, TypeError):
+            pass
+        if (
+            REPORT_CACHE["path"] != str(path)
+            or size < int(REPORT_CACHE["offset"])
+            or REPORT_CACHE.get("reset_at") != reset_at
+        ):
+            REPORT_CACHE.update(
+                path=str(path), offset=min(reset_offset, size),
+                maximum=0.0, reset_at=reset_at,
+            )
         offset = int(REPORT_CACHE["offset"])
         try:
             with path.open("rb") as stream:
@@ -227,7 +285,10 @@ def maximum_completed_run(path: Path) -> float:
                     continue
                 if record.get("event") == "run_completed":
                     try:
-                        REPORT_CACHE["maximum"] = max(float(REPORT_CACHE["maximum"]), float(record.get("seconds", 0)))
+                        REPORT_CACHE["maximum"] = max(
+                            float(REPORT_CACHE["maximum"]),
+                            float(record.get("seconds", 0)),
+                        )
                     except (TypeError, ValueError):
                         pass
             REPORT_CACHE["offset"] = offset + complete_end
@@ -358,6 +419,8 @@ class Handler(BaseHTTPRequestHandler):
             ok, message = stop_trainer()
         elif route == "/api/quit-game":
             ok, message = quit_game()
+        elif route == "/api/reset-longest":
+            ok, message = reset_longest_run(self.report_path)
         else:
             self.send_error(404)
             return
