@@ -172,6 +172,11 @@ def capture_live_screen() -> None:
                 raise OSError("Could not encode the live game frame")
             LIVE_PREVIEW_TEMP.replace(LIVE_PREVIEW_PATH)
         except Exception:
+            if bridge is not None:
+                try:
+                    bridge.close()
+                except Exception:
+                    pass
             bridge = None
             time.sleep(.5)
             continue
