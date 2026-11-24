@@ -36,10 +36,19 @@ class VampireSurvivorsBridge:
             import mss
         except ImportError as exc:
             raise ImportError("Linux screen capture requires mss: python -m pip install mss") from exc
-        self._mss = mss.mss()
+        # Find a visible game window before opening an X11 capture connection.
+        # If lookup fails, no display client is left behind by a partial init.
         self.window_title = window_title.casefold()
         self._held: set[str] = set()
         self.window_id = self._find_window()[0]
+        self._mss = mss.mss()
+
+    def close(self) -> None:
+        """Release the X11 connection used by MSS."""
+        capture = getattr(self, "_mss", None)
+        if capture is not None:
+            self._mss = None
+            capture.close()
 
     def _run(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(args, capture_output=True, text=True, timeout=5)
