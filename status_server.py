@@ -1,36 +1,31 @@
-"""LAN dashboard with live gameplay capture and training controls."""
+"""LAN dashboard for live training progress with fixed start and stop controls."""
 
 from __future__ import annotations
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import signal
 import shutil
 import subprocess
-import sys
 import threading
-import time
-from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
+import learning_check
+
 ROOT = Path(__file__).parent.resolve()
 DEFAULT_REPORT = ROOT / "data" / "training-progress.jsonl"
-LIVE_PREVIEW_PATH = ROOT / "data" / "dashboard-live-screen.jpg"
-LIVE_PREVIEW_TEMP = ROOT / "data" / "dashboard-live-screen.tmp.jpg"
 PID_FILE = ROOT / "data" / "trainer.pid"
 LOG_FILE = ROOT / "data" / "trainer-console.log"
-LONGEST_RESET_FILE = ROOT / "data" / "longest-run-reset.json"
-LONGEST_RESET_TEMP = ROOT / "data" / "longest-run-reset.tmp"
 HTML = (ROOT / "status.html").read_bytes()
 LOCK = threading.Lock()
 TRAINER: subprocess.Popen | None = None
 GAME_LAUNCH: subprocess.Popen | None = None
-REPORT_CACHE: dict[str, object] = {
-    "path": None, "offset": 0, "maximum": 0.0, "reset_at": None,
-}
+REPORT_CACHE: dict[str, object] = {"file": None, "offset": 0, "maximum": 0.0}
 REPORT_LOCK = threading.Lock()
+PROGRESS_EVENTS = {"progress", "run_completed", "run_started", "session_stopped"}
 
 
 def trainer_pid() -> int | None:
@@ -42,7 +37,7 @@ def trainer_pid() -> int | None:
         cwd = Path(f"/proc/{pid}/cwd").resolve()
     except (OSError, ValueError):
         return None
-    if "train_agent.py" in cmdline and cwd == ROOT:
+    if cwd == ROOT and any(script in cmdline for script in ("train_agent.py", "learning_check.py")):
         return pid
     return None
 
@@ -88,237 +83,143 @@ def launch_game() -> tuple[bool, str]:
             return False, f"Could not start Steam: {exc}"
     return True, "Steam was asked to launch Vampire Survivors. The game may take a moment to open."
 
-def _recent_report_records(path: Path) -> list[dict]:
+
+def _report_record(line: bytes) -> dict | None:
+    try:
+        record = json.loads(line)
+    except ValueError:
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def latest_reports(path: Path) -> tuple[dict | None, dict | None]:
+    """Read the newest progress record and screen heartbeat in one pass."""
     try:
         with path.open("rb") as stream:
             stream.seek(0, os.SEEK_END)
-            end = stream.tell()
-            stream.seek(max(0, end - 65536))
-            lines = stream.read().splitlines()
+            start = max(0, stream.tell() - 65536)
+            stream.seek(max(0, start - 1))
+            if start:
+                stream.readline()
+            lines = stream.read().split(b"\n")
     except OSError:
-        return []
-    records = []
-    for line in reversed(lines):
-        try:
-            records.append(json.loads(line))
-        except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, None
+    latest = diagnostic = None
+    # Skip the trailing segment, which may be a write still in progress.
+    for line in reversed(lines[:-1]):
+        record = _report_record(line)
+        if record is None:
             continue
-    return records
-
-
-def latest_report(path: Path) -> dict | None:
-    for record in _recent_report_records(path):
-        if record.get("event") in {"progress", "run_completed", "run_started", "session_stopped"}:
-            return record
-    return None
-
-
-def latest_screen_status(path: Path) -> dict | None:
-    for record in _recent_report_records(path):
-        if record.get("event") == "screen_status":
-            return record
-    return None
-
-
-def newest_preview_path(report_path: Path) -> Path | None:
-    candidates = (LIVE_PREVIEW_PATH, report_path.with_name("current-screen.jpg"))
-    available: list[tuple[int, Path]] = []
-    for candidate in candidates:
-        try:
-            available.append((candidate.stat().st_mtime_ns, candidate))
-        except OSError:
+        event = record.get("event")
+        if not isinstance(event, str):
             continue
-    return max(available, default=(0, None), key=lambda item: item[0])[1]
+        if latest is None and event in PROGRESS_EVENTS:
+            latest = record
+        elif diagnostic is None and event == "screen_status":
+            diagnostic = record
+        if latest is not None and diagnostic is not None:
+            break
+    return latest, diagnostic
 
-
-def preview_timestamp(report_path: Path) -> str | None:
-    path = newest_preview_path(report_path)
-    if path is None:
-        return None
-    try:
-        modified = path.stat().st_mtime
-    except OSError:
-        return None
-    return datetime.fromtimestamp(modified, timezone.utc).isoformat()
-
-
-def capture_live_screen() -> None:
-    """Capture the visible game independently of the trainer's slower reports."""
-    if not sys.platform.startswith("linux"):
-        return
-    try:
-        import cv2
-        from linux_bridge import VampireSurvivorsBridge
-    except Exception as exc:
-        print(f"Live screen capture unavailable: {exc}", flush=True)
-        return
-    LIVE_PREVIEW_PATH.parent.mkdir(parents=True, exist_ok=True)
-    bridge = None
-    while True:
-        try:
-            if bridge is None:
-                bridge = VampireSurvivorsBridge()
-            frame = bridge.capture()
-            height, width = frame.shape[:2]
-            if width > 960:
-                frame = cv2.resize(
-                    frame, (960, round(height * 960 / width)),
-                    interpolation=cv2.INTER_AREA,
-                )
-            if not cv2.imwrite(
-                str(LIVE_PREVIEW_TEMP), frame,
-                [cv2.IMWRITE_JPEG_QUALITY, 70],
-            ):
-                raise OSError("Could not encode the live game frame")
-            LIVE_PREVIEW_TEMP.replace(LIVE_PREVIEW_PATH)
-        except Exception:
-            if bridge is not None:
-                try:
-                    bridge.close()
-                except Exception:
-                    pass
-            bridge = None
-            time.sleep(.5)
-            continue
-        time.sleep(.25)
 
 def quit_game() -> tuple[bool, str]:
     """Ask the visible game window to close cleanly; never kill its process."""
     if not game_running():
         return False, "Vampire Survivors is not running."
-    xdotool = ROOT / ".local-deps" / "usr" / "bin" / "xdotool"
-    if not xdotool.is_file():
-        return False, "The bundled xdotool utility is missing; the game was left running."
+    wmctrl = shutil.which("wmctrl")
+    if not wmctrl:
+        return False, "wmctrl was not found; the game was left running."
     try:
         found = subprocess.run(
-            [str(xdotool), "search", "--onlyvisible", "--name", "Vampire Survivors"],
+            [wmctrl, "-l"],
             capture_output=True, text=True, timeout=5, check=False,
         )
-        window_ids = [line.strip() for line in found.stdout.splitlines() if line.strip().isdigit()]
+        window_ids = []
+        for line in found.stdout.splitlines():
+            fields = line.split(maxsplit=3)
+            if len(fields) == 4 and fields[3].strip().casefold() == "vampire survivors":
+                window_ids.append(fields[0])
         if not window_ids:
             return False, "Could not find the visible game window; the game was left running."
-        closed = 0
         for window_id in window_ids:
             result = subprocess.run(
-                [str(xdotool), "windowclose", window_id],
+                [wmctrl, "-ic", window_id],
                 capture_output=True, text=True, timeout=5, check=False,
             )
             if result.returncode == 0:
-                closed += 1
-        if closed:
-            return True, "Close requested. Vampire Survivors should exit cleanly."
+                return True, "Close requested. Vampire Survivors should exit cleanly."
         return False, "The game window did not accept the close request; it was left running."
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, f"Could not request a clean close: {exc}"
 
-def _complete_report_offset(path: Path) -> int:
-    """Return a byte offset just after the last complete JSONL record."""
-    try:
-        size = path.stat().st_size
-        start = max(0, size - 65536)
-        with path.open("rb") as stream:
-            stream.seek(start)
-            tail = stream.read()
-    except OSError:
-        return 0
-    newline = tail.rfind(b"\n")
-    return start + newline + 1 if newline >= 0 else 0
-
-
-def reset_longest_run(path: Path) -> tuple[bool, str]:
-    """Reset the dashboard maximum without deleting training history."""
-    with REPORT_LOCK:
-        offset = _complete_report_offset(path)
-        reset_at = datetime.now(timezone.utc).isoformat()
-        marker = {
-            "report_path": str(path),
-            "offset": offset,
-            "reset_at": reset_at,
-        }
-        try:
-            LONGEST_RESET_FILE.parent.mkdir(parents=True, exist_ok=True)
-            LONGEST_RESET_TEMP.write_text(
-                json.dumps(marker, sort_keys=True), encoding="utf-8",
-            )
-            LONGEST_RESET_TEMP.replace(LONGEST_RESET_FILE)
-        except OSError as exc:
-            return False, f"Could not save longest-run reset: {exc}"
-        REPORT_CACHE.update(
-            path=str(path), offset=offset, maximum=0.0, reset_at=reset_at,
-        )
-    return True, "Longest run reset to 0:00. Completed run history was kept."
-
 
 def maximum_completed_run(path: Path) -> float:
-    """Incrementally track completed runs since the last dashboard reset."""
-    try:
-        size = path.stat().st_size
-    except OSError:
-        return float(REPORT_CACHE["maximum"])
+    """Incrementally track the longest recorded completed run in the JSONL log."""
     with REPORT_LOCK:
-        reset_at = None
-        reset_offset = 0
-        try:
-            marker = json.loads(LONGEST_RESET_FILE.read_text(encoding="utf-8"))
-            if marker.get("report_path") == str(path):
-                reset_at = marker.get("reset_at")
-                reset_offset = max(0, int(marker.get("offset", 0)))
-        except (OSError, ValueError, TypeError):
-            pass
-        if (
-            REPORT_CACHE["path"] != str(path)
-            or size < int(REPORT_CACHE["offset"])
-            or REPORT_CACHE.get("reset_at") != reset_at
-        ):
-            REPORT_CACHE.update(
-                path=str(path), offset=min(reset_offset, size),
-                maximum=0.0, reset_at=reset_at,
-            )
-        offset = int(REPORT_CACHE["offset"])
         try:
             with path.open("rb") as stream:
+                stat = os.fstat(stream.fileno())
+                identity = (path, stat.st_dev, stat.st_ino)
+                if REPORT_CACHE["file"] != identity or stat.st_size < int(REPORT_CACHE["offset"]):
+                    REPORT_CACHE.update(file=identity, offset=0, maximum=0.0)
+                offset = int(REPORT_CACHE["offset"])
                 stream.seek(offset)
-                data = stream.read()
-        except OSError:
-            return float(REPORT_CACHE["maximum"])
-        complete_end = data.rfind(b"\n") + 1
-        if complete_end:
-            for line in data[:complete_end].splitlines():
-                try:
-                    record = json.loads(line)
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    continue
-                if record.get("event") == "run_completed":
+                maximum = float(REPORT_CACHE["maximum"])
+                while line := stream.readline():
+                    if not line.endswith(b"\n"):
+                        break
+                    offset += len(line)
+                    if b"run_completed" not in line and b"\\u" not in line:
+                        continue
+                    record = _report_record(line)
+                    if record is None or record.get("event") != "run_completed":
+                        continue
                     try:
-                        REPORT_CACHE["maximum"] = max(
-                            float(REPORT_CACHE["maximum"]),
-                            float(record.get("seconds", 0)),
-                        )
-                    except (TypeError, ValueError):
-                        pass
-            REPORT_CACHE["offset"] = offset + complete_end
-        return float(REPORT_CACHE["maximum"])
+                        seconds = float(record.get("seconds", 0))
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    if math.isfinite(seconds):
+                        maximum = max(maximum, seconds)
+        except OSError:
+            return 0.0
+        REPORT_CACHE.update(offset=offset, maximum=maximum)
+        return maximum
 
-def start_trainer(report: Path) -> tuple[bool, str]:
+
+def start_trainer(report: Path, *, check: bool = False) -> tuple[bool, str]:
     global TRAINER
     with LOCK:
         if trainer_pid() is not None:
             return False, "Trainer is already running."
-        local = ROOT / ".local-deps" / "usr"
-        env = os.environ.copy()
-        env["PATH"] = str(local / "bin") + ":" + env.get("PATH", "")
-        env["LD_LIBRARY_PATH"] = str(local / "lib/x86_64-linux-gnu") + ":" + env.get("LD_LIBRARY_PATH", "")
-        env["TESSDATA_PREFIX"] = str(local / "share/tesseract-ocr/5/tessdata")
-        report.parent.mkdir(parents=True, exist_ok=True)
-        with LOG_FILE.open("ab") as output:
-            TRAINER = subprocess.Popen(
-                [str(ROOT / ".venv/bin/python"), "-B", "-u", str(ROOT / "train_agent.py"),
-                 "--full-run", "--deep-learning", "--report-path", str(report)],
-                cwd=ROOT, env=env, stdout=output, stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-        PID_FILE.write_text(str(TRAINER.pid), encoding="utf-8")
-        return True, "Training started."
+        if not os.access(ROOT / ".venv/bin/python", os.X_OK):
+            return False, "Trainer environment is missing. Run bash setup_linux.sh first."
+        if check and not learning_check.CHECKPOINT.is_file():
+            return False, "The learning check needs a saved DQN checkpoint. Run training first."
+        if check and not game_running():
+            return False, "Launch Vampire Survivors before starting the learning check."
+        try:
+            report = report.absolute()
+            if check:
+                command = [str(ROOT / ".venv/bin/python"), "-B", "-u", str(ROOT / "learning_check.py")]
+            else:
+                report.parent.mkdir(parents=True, exist_ok=True)
+                command = ["bash", str(ROOT / "run-local.sh"),
+                           "--full-run", "--deep-learning", "--report-path", str(report)]
+            LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with LOG_FILE.open("ab") as output:
+                TRAINER = subprocess.Popen(
+                    command,
+                    cwd=ROOT, stdout=output, stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+        except OSError as exc:
+            return False, f"Could not start the trainer: {exc}"
+        message = "Learning check started." if check else "Training started."
+        try:
+            PID_FILE.write_text(str(TRAINER.pid), encoding="utf-8")
+        except OSError as exc:
+            return True, f"{message} Could not save the trainer PID: {exc}"
+        return True, message
 
 
 def stop_trainer() -> tuple[bool, str]:
@@ -330,6 +231,15 @@ def stop_trainer() -> tuple[bool, str]:
     except (ProcessLookupError, PermissionError):
         return False, "Could not signal the trainer."
     return True, "Stop requested. The trainer is saving its checkpoint."
+
+
+def active_check_report(check: dict | None, pid: int | None) -> Path | None:
+    if check is None or check.get("status") != "running":
+        return None
+    if pid is None or check.get("pid") != pid:
+        check["status"] = "stopped"
+        return None
+    return learning_check.phase_report(check)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -346,14 +256,17 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(HTML)
             return
         if route == "/api/status":
-            diagnostic = latest_screen_status(self.report_path) or {}
-            live_timestamp = preview_timestamp(self.report_path)
-            if live_timestamp is not None:
-                diagnostic["screen_preview_updated_at"] = live_timestamp
+            pid = trainer_pid()
+            check = learning_check.latest_check()
+            phase_report = active_check_report(check, pid)
+            latest, diagnostic = latest_reports(phase_report or self.report_path)
+            if phase_report is not None and latest is not None:
+                check["completed_in_phase"] = latest.get("completed_runs", 0)
             payload = json.dumps({
-                "trainer_running": trainer_pid() is not None,
+                "trainer_running": pid is not None,
                 "game_running": game_running(),
-                "latest": latest_report(self.report_path),
+                "learning_check": check,
+                "latest": latest,
                 "diagnostic": diagnostic,
                 "maximum_run_seconds": maximum_completed_run(self.report_path),
                 "report_path": str(self.report_path),
@@ -364,41 +277,10 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(payload)
             return
-        if route == "/api/screen-stream":
-            self.send_response(200)
-            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Connection", "keep-alive")
-            self.end_headers()
-            last_path = None
-            last_mtime = None
-            while True:
-                try:
-                    preview = newest_preview_path(self.report_path)
-                    if preview is None:
-                        time.sleep(.2)
-                        continue
-                    mtime = preview.stat().st_mtime_ns
-                    if preview != last_path or mtime != last_mtime:
-                        payload = preview.read_bytes()
-                        part = (
-                            b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
-                            + str(len(payload)).encode("ascii")
-                            + b"\r\n\r\n" + payload + b"\r\n"
-                        )
-                        self.wfile.write(part)
-                        self.wfile.flush()
-                        last_path = preview
-                        last_mtime = mtime
-                    time.sleep(.1)
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    return
         if route == "/api/screen-preview":
             try:
-                preview = newest_preview_path(self.report_path)
-                if preview is None:
-                    raise FileNotFoundError
-                payload = preview.read_bytes()
+                report = active_check_report(learning_check.latest_check(), trainer_pid()) or self.report_path
+                payload = report.with_name("current-screen.jpg").read_bytes()
             except OSError:
                 self.send_error(404, "Screen preview is not available yet")
                 return
@@ -420,12 +302,12 @@ class Handler(BaseHTTPRequestHandler):
             ok, message = launch_game()
         elif route == "/api/start":
             ok, message = start_trainer(self.report_path)
+        elif route == "/api/learning-check":
+            ok, message = start_trainer(self.report_path, check=True)
         elif route == "/api/stop":
             ok, message = stop_trainer()
         elif route == "/api/quit-game":
             ok, message = quit_game()
-        elif route == "/api/reset-longest":
-            ok, message = reset_longest_run(self.report_path)
         else:
             self.send_error(404)
             return
@@ -443,8 +325,7 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--report-path", type=Path, default=DEFAULT_REPORT)
     args = parser.parse_args()
-    Handler.report_path = args.report_path
-    threading.Thread(target=capture_live_screen, name="dashboard-live-screen", daemon=True).start()
+    Handler.report_path = args.report_path.absolute()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"Dashboard listening on port {args.port}; report: {args.report_path}", flush=True)
     server.serve_forever()

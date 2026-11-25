@@ -303,19 +303,6 @@ class VampireSurvivorsBridge:
         finally:
             mouse(_MOUSEEVENTF_LEFTUP)
 
-    def press_key(self, key: str) -> None:
-        """Tap a supported menu key after confirming the game has focus."""
-        virtual_key = {"enter": 0x0D, "space": 0x20}.get(key.casefold())
-        if virtual_key is None:
-            raise ValueError(f"Unsupported menu key: {key}")
-        if not self.is_foreground():
-            raise RuntimeError("Vampire Survivors is not foreground; refusing key input")
-        self._send_key(virtual_key, down=True)
-        try:
-            time.sleep(.05)
-        finally:
-            self._send_key(virtual_key, down=False)
-
     def windows_key_down(self, direction: str) -> bool:
         """Report Windows' current key state, independently of game movement."""
         return bool(_user32.GetAsyncKeyState(_VK[direction]) & 0x8000)

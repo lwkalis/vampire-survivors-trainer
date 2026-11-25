@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import difflib
 from datetime import datetime, timezone
 import json
+import math
 from pathlib import Path
 import re
 import time
@@ -22,6 +24,7 @@ from xp_reward import (
 )
 from upgrade_policy import (
     GoldCounter, KillCounter, UpgradeLearner, card_click_position, read_cards, read_game_over_heading,
+    read_game_timer_seconds,
     read_screen_ocr, read_screen_text,
 )
 
@@ -29,8 +32,8 @@ from upgrade_policy import (
 DATA_PATH = Path(__file__).parent / "data" / "vision_policy.json"
 MENU_POLL_INTERVAL = .15
 MENU_POST_CLICK_DELAY = .30
-SCREEN_HEARTBEAT_INTERVAL = 1.0
-SCREEN_PREVIEW_INTERVAL = 0.5
+SCREEN_HEARTBEAT_INTERVAL = 2.0
+SCREEN_PREVIEW_INTERVAL = 3.0
 UNKNOWN_SCREEN_OCR_INTERVAL = 5.0
 
 
@@ -104,28 +107,34 @@ class ScreenStatusReporter:
             self.last_heartbeat = now
 
 
-def load_stats() -> tuple[list[int], list[float]]:
-    if not DATA_PATH.exists():
+def load_stats(path: Path | None = None) -> tuple[list[int], list[float]]:
+    path = DATA_PATH if path is None else path
+    if not path.exists():
         return [0] * len(MOVES), [0.0] * len(MOVES)
     try:
-        saved = json.loads(DATA_PATH.read_text(encoding="utf-8"))
-        counts = saved.get("counts", [])
-        means = saved.get("means", [])
-        if len(counts) == len(MOVES) and len(means) == len(MOVES):
-            return [int(x) for x in counts], [float(x) for x in means]
-    except (OSError, ValueError, TypeError):
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(saved, dict):
+            counts = saved.get("counts", [])
+            means = saved.get("means", [])
+            if len(counts) == len(MOVES) and len(means) == len(MOVES):
+                counts = [int(value) for value in counts]
+                means = [float(value) for value in means]
+                if all(count >= 0 for count in counts) and all(map(math.isfinite, means)):
+                    return counts, means
+    except (OSError, ValueError, TypeError, OverflowError):
         pass
     return [0] * len(MOVES), [0.0] * len(MOVES)
 
 
-def save_stats(counts: list[int], means: list[float]) -> None:
-    DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
-    temporary = DATA_PATH.with_suffix(".tmp")
+def save_stats(counts: list[int], means: list[float], path: Path | None = None) -> None:
+    path = DATA_PATH if path is None else path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
     temporary.write_text(
         json.dumps({"counts": counts, "means": means, "actions": MOVES}, indent=2),
         encoding="utf-8",
     )
-    temporary.replace(DATA_PATH)
+    temporary.replace(path)
 
 
 def _label_key(text: str) -> str:
@@ -133,6 +142,8 @@ def _label_key(text: str) -> str:
 
 
 def startup_screen_phase(screen: str) -> str:
+    if "interestedinthis" in screen:
+        return "unlock-menu"
     if "photosensitivitywarning" in screen:
         return "photosensitivity-warning"
     if "gameover" in screen:
@@ -162,9 +173,7 @@ def click_ocr_label(
             continue
         actual = _label_key(str(line.get("text", "")))
         similar = difflib.SequenceMatcher(None, actual, wanted).ratio() >= .82
-        prefix_match = (
-            wanted in {"quit", "options", "start"} and actual.startswith(wanted)
-        ) or (wanted == "poe" and actual.startswith("poeratcho"))
+        prefix_match = wanted in {"quit", "options", "start"} and actual.startswith(wanted)
         if actual != wanted and not similar and not prefix_match:
             continue
         try:
@@ -200,46 +209,22 @@ def stage_checkbox_checked(frame, stage: str) -> bool:
     return bool(crop.size and float((crop.max(axis=2) > 175).mean()) > .06)
 
 
-def interested_page_visible(frame) -> bool:
-    """Recognize the optional DLC prompt by its centered heading."""
-    height, width = frame.shape[:2]
-    title = frame[
-        round(.105 * height):round(.22 * height),
-        round(.28 * width):round(.72 * width),
-    ]
-    if not title.size:
-        return False
-    enlarged = cv2.resize(title, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
-    text, _ = read_screen_ocr(enlarged, white_text=True, page_mode=7)
-    normalized = _label_key(text)
-    if "interested" in normalized and "this" in normalized:
-        return True
-    text, _ = read_screen_ocr(enlarged, page_mode=7)
-    normalized = _label_key(text)
-    return "interested" in normalized and "this" in normalized
-
-
 def start_configured_run(
     bridge: VampireSurvivorsBridge, timeout: float, *, allow_active: bool = False,
-    reporter: ScreenStatusReporter | None = None, first_launch: bool = False,
+    reporter: ScreenStatusReporter | None = None, require_fresh: bool = False,
 ) -> None:
-    """Navigate title → Poe → Mad Forest → gameplay, verifying each screen."""
+    """Navigate title → Gennaro → Inlaid Library → gameplay, verifying each screen."""
     deadline = time.monotonic() + timeout
     title_start_clicked = False
     title_splash_clicked = False
-    title_start_last_attempt = 0.0
-    first_launch_advance_sent = False
-    photosensitivity_attempts = 0
     run_start_clicked = False
     character_clicked = False
     character_confirmed = False
-    library_unchecked_clicked = False
+    library_clicked = False
     mad_forest_clicked = False
-    stage_clicked = False
     stage_start_clicked = False
     stage_start_last_attempt = 0.0
-    interested_check_last_attempt = 0.0
-    interested_back_last_attempt = 0.0
+    unlock_back_last_attempt = 0.0
     last_message = None
     while time.monotonic() < deadline:
         if not bridge.is_foreground():
@@ -259,17 +244,17 @@ def start_configured_run(
                     return_to_title_after_death(bridge, remaining, reporter=reporter)
                     title_start_clicked = False
                     title_splash_clicked = False
-                    title_start_last_attempt = 0.0
                     run_start_clicked = False
                     character_clicked = False
                     character_confirmed = False
-                    library_unchecked_clicked = False
+                    library_clicked = False
                     mad_forest_clicked = False
-                    stage_clicked = False
                     stage_start_clicked = False
                     last_message = None
                     continue
             if level_up_visible(frame):
+                if require_fresh and not run_start_clicked:
+                    raise RuntimeError("Evaluation needs a fresh run. Open the title or Game Over screen.")
                 if reporter is not None:
                     reporter.publish(frame, "upgrade-menu")
                 print("startup: open upgrade choice found; resuming the active run", flush=True)
@@ -278,30 +263,12 @@ def start_configured_run(
                 if reporter is not None:
                     reporter.publish(frame, "gameplay")
                 if allow_active or run_start_clicked:
-                    print("ready: configured Poe / Mad Forest run is active", flush=True)
+                    print("ready: configured Gennaro / Inlaid Library run is active", flush=True)
                     return
                 raise RuntimeError(
                     "Gameplay is already active. Start the new run from the title menu "
                     "or use --attach to continue this run."
                 )
-            now = time.monotonic()
-            if now - interested_check_last_attempt >= 0.75:
-                interested_check_last_attempt = now
-                if interested_page_visible(frame):
-                    if reporter is not None:
-                        reporter.publish(frame, "promo-page", screen_text="Interested in this?")
-                    if now - interested_back_last_attempt >= 1.0:
-                        bridge.release_all()
-                        bridge.click_client(.50, .80)
-                        interested_back_last_attempt = now
-                        message = "promo-page: clicked Back"
-                    else:
-                        message = "promo-page: waiting for Back to close"
-                    if message != last_message:
-                        print(message, flush=True)
-                        last_message = message
-                    time.sleep(MENU_POLL_INTERVAL)
-                    continue
             screen_text, screen_lines = read_screen_ocr(frame)
             screen = _label_key(screen_text)
             startup_labels = ("characterselection", "stageselection", "firstsurvivaton",
@@ -312,74 +279,69 @@ def start_configured_run(
                 screen = _label_key(screen_text)
             if reporter is not None:
                 reporter.publish(frame, startup_screen_phase(screen), screen_text=screen_text)
-            if "photosensitivity" in screen and "warning" in screen:
-                # The first-launch disclaimer can require an extra input after
-                # the initial acknowledgment. Click its lower-center button,
-                # then tap Enter once if the warning remains visible.
-                if photosensitivity_attempts < 2:
-                    photosensitivity_attempts += 1
-                    if photosensitivity_attempts == 1:
-                        bridge.click_client(.50, .82)
-                        message = "startup: acknowledged the photosensitivity warning"
-                    else:
-                        bridge.press_key("enter")
-                        message = "startup: sent extra photosensitivity input"
+            if "interestedinthis" in screen:
+                # A run can be left on the collection's unlock/shop overlay.
+                # It has no path into gameplay; return to the title menu first.
+                now = time.monotonic()
+                if now - unlock_back_last_attempt >= 1.5:
+                    if not click_ocr_label(
+                        bridge, frame, "Back", (.53, .84), (screen_text, screen_lines),
+                    ):
+                        bridge.click_client(.53, .84)
+                    unlock_back_last_attempt = now
+                    message = "startup: closing the unlock menu with Back"
                 else:
-                    message = "startup: waiting for photosensitivity warning to clear"
-            elif (
-                first_launch and not first_launch_advance_sent
-                and not any(label in screen for label in (
-                    "characterselection", "stageselection", "firstsurvivaton",
-                    "quickstart", "vampiresurvivors", "gameover",
-                ))
-            ):
-                # OCR can miss the first-launch disclaimer entirely. A single
-                # Enter advances it; inspect the new screen before acting again.
-                bridge.press_key("enter")
-                first_launch_advance_sent = True
-                message = "startup: sent first-launch continue input"
-            elif "gameover" in screen:
+                    message = "startup: waiting for the unlock menu to close"
+                time.sleep(MENU_POST_CLICK_DELAY)
+                continue
+            if ("photosensitivity" in screen and "warning" in screen
+                    and ("presstostart" in screen or "start" in screen)):
+                # The first-launch disclaimer is a separate screen from the
+                # ordinary title splash. Its button sits near the bottom
+                # center of the game client (about 82% down the frame).
+                bridge.click_client(.50, .82)
+                message = "startup: acknowledged the photosensitivity warning"
+                time.sleep(MENU_POST_CLICK_DELAY)
+                continue
+            if "gameover" in screen:
                 print("startup: Game Over detected in OCR; returning to title", flush=True)
                 remaining = max(.1, deadline - time.monotonic())
                 return_to_title_after_death(bridge, remaining, reporter=reporter)
                 title_start_clicked = False
                 title_splash_clicked = False
-                title_start_last_attempt = 0.0
                 run_start_clicked = False
                 character_clicked = False
                 character_confirmed = False
-                library_unchecked_clicked = False
+                library_clicked = False
                 mad_forest_clicked = False
-                stage_clicked = False
                 stage_start_clicked = False
                 last_message = None
                 continue
-            elif "characterselection" in screen:
+            if "characterselection" in screen:
                 if not character_clicked:
-                    if click_ocr_label(bridge, frame, "Poe", ocr=(screen_text, screen_lines)):
+                    if click_ocr_label(bridge, frame, "Gennaro", (.645, .28), (screen_text, screen_lines)):
                         character_clicked = True
-                        message = "selection: chose Poe"
+                        message = "selection: chose Gennaro"
                     else:
-                        message = "selection: waiting for the Poe card"
+                        message = "selection: waiting for the Gennaro card"
                 elif not character_confirmed:
                     if not click_ocr_label(bridge, frame, "Confirm", (.824, .93), (screen_text, screen_lines)):
                         bridge.click_client(.824, .93)
                     character_confirmed = True
-                    message = "selection: confirmed Poe"
-                elif not stage_checkbox_checked(frame, "Mad Forest"):
-                    if not mad_forest_clicked:
-                        bridge.click_client(.752, .228)
-                        mad_forest_clicked = True
-                        message = "selection: clicked Mad Forest checkbox"
+                    message = "selection: confirmed Gennaro"
+                elif not library_clicked:
+                    if not stage_checkbox_checked(frame, "Inlaid Library"):
+                        bridge.click_client(.752, .261)
+                        library_clicked = True
+                        message = "selection: clicked Inlaid Library checkbox"
                     else:
-                        message = "selection: waiting for Mad Forest to be selected"
-                elif stage_checkbox_checked(frame, "Inlaid Library"):
-                    if not library_unchecked_clicked:
-                        bridge.click_client(.752, .260)
-                        library_unchecked_clicked = True
-                        message = "selection: unchecked Inlaid Library"
-                    else:
-                        message = "selection: waiting for Inlaid Library to clear"
+                        library_clicked = True
+                        message = "selection: Inlaid Library checked"
+                elif (not mad_forest_clicked
+                      and stage_checkbox_checked(frame, "Mad Forest")):
+                    bridge.click_client(.752, .228)
+                    mad_forest_clicked = True
+                    message = "selection: unchecked Mad Forest"
                 else:
                     start_button_clicked = click_ocr_label(
                         bridge, frame, "Start", (.824, .93), (screen_text, screen_lines),
@@ -387,18 +349,14 @@ def start_configured_run(
                     if not start_button_clicked:
                         bridge.click_client(.824, .93)
                     run_start_clicked = True
-                    message = "selection: starting Poe in Mad Forest"
+                    message = "selection: starting Gennaro in Inlaid Library"
             elif "stageselection" in screen:
-                if not stage_clicked:
-                    if click_ocr_label(bridge, frame, "Mad Forest", ocr=(screen_text, screen_lines)):
-                        stage_clicked = True
-                        message = "selection: chose Mad Forest"
+                if not library_clicked:
+                    if click_ocr_label(bridge, frame, "Inlaid Library", (.365, .417), (screen_text, screen_lines)):
+                        library_clicked = True
+                        message = "selection: chose Inlaid Library"
                     else:
-                        # Mad Forest is the first stage card. Its title is small
-                        # and OCR often misses it on this screen.
-                        bridge.click_client(.365, .255)
-                        stage_clicked = True
-                        message = "selection: clicked the Mad Forest card"
+                        message = "selection: waiting for Inlaid Library"
                 elif not stage_start_clicked:
                     # The Start label is sometimes omitted by Windows OCR on
                     # this busy stage screen; use the calibrated button point.
@@ -406,39 +364,29 @@ def start_configured_run(
                     stage_start_clicked = True
                     stage_start_last_attempt = time.monotonic()
                     run_start_clicked = True
-                    message = "selection: starting Mad Forest"
+                    message = "selection: starting Inlaid Library"
                 elif time.monotonic() - stage_start_last_attempt >= 2.0:
                     # Retry if the menu did not accept the first click.
                     bridge.click_client(.824, .93)
                     stage_start_last_attempt = time.monotonic()
-                    message = "selection: retrying Mad Forest Start"
+                    message = "selection: retrying Inlaid Library Start"
                 else:
-                    message = "selection: waiting for Mad Forest to start"
-            elif (
-                title_splash_clicked
-                or "firstsurvivaton" in screen
-                or "quickstart" in screen
-                or "vampiresurvivors" in screen
-            ):
-                # The title tagline can appear on the menu while OCR misses
-                # the visible START label. Retry the calibrated button until
-                # the character/stage selection screen is recognized.
-                now = time.monotonic()
-                if not title_start_clicked or now - title_start_last_attempt >= 1.5:
-                    retrying = title_start_clicked
-                    if not click_ocr_label(
-                        bridge, frame, "Start", (.50, .65), (screen_text, screen_lines),
-                    ):
-                        bridge.click_client(.50, .65)
-                    title_start_clicked = True
-                    title_splash_clicked = True
-                    title_start_last_attempt = now
-                    message = (
-                        "title-menu: retrying Start" if retrying
-                        else "title-menu: clicked Start"
-                    )
-                else:
-                    message = "menu-check: waiting for title menu response"
+                    message = "selection: waiting for Inlaid Library to start"
+            elif (not title_splash_clicked and "firstsurvivaton" in screen):
+                bridge.click_client(.50, .65)
+                title_splash_clicked = True
+                message = "title-menu: advancing past the title splash"
+            elif (not title_start_clicked
+                  and ("quickstart" in screen or "vampiresurvivors" in screen)):
+                # Tesseract often sees the title art but misses the large
+                # central START button. The title-menu layout is stable, so
+                # use its calibrated button center when OCR has no label box.
+                if not click_ocr_label(
+                    bridge, frame, "Start", (.50, .65), (screen_text, screen_lines),
+                ):
+                    bridge.click_client(.50, .65)
+                title_start_clicked = True
+                message = "title-menu: clicked Start"
             else:
                 message = "menu-check: waiting for Start or the next selection screen"
         if message != last_message:
@@ -464,8 +412,6 @@ def return_to_title_after_death(
     options_clicked = False
     quit_clicked = False
     splash_clicked = False
-    interested_check_last_attempt = 0.0
-    interested_back_last_attempt = 0.0
     last_message = None
     while time.monotonic() < deadline:
         if not bridge.is_foreground():
@@ -474,24 +420,6 @@ def return_to_title_after_death(
                 reporter.publish(None, "focus-required")
         else:
             frame = bridge.capture()
-            now = time.monotonic()
-            if now - interested_check_last_attempt >= 0.75:
-                interested_check_last_attempt = now
-                if interested_page_visible(frame):
-                    if reporter is not None:
-                        reporter.publish(frame, "promo-page", screen_text="Interested in this?")
-                    if now - interested_back_last_attempt >= 1.0:
-                        bridge.release_all()
-                        bridge.click_client(.50, .80)
-                        interested_back_last_attempt = now
-                        message = "promo-page: clicked Back"
-                    else:
-                        message = "promo-page: waiting for Back to close"
-                    if message != last_message:
-                        print(message, flush=True)
-                        last_message = message
-                    time.sleep(MENU_POLL_INTERVAL)
-                    continue
             text, lines = read_screen_ocr(frame)
             screen = _label_key(text)
             restart_labels = ("quickstart", "characterselection", "stageselection",
@@ -647,11 +575,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--control", action="store_true", help="allow movement input")
     parser.add_argument("--full-run", action="store_true",
-                        help="select Poe and Mad Forest, learn, and restart after death")
+                        help="select Gennaro and Inlaid Library, learn, and restart after death")
     parser.add_argument("--attach", action="store_true",
                         help="with --full-run, accept an already active run as the first run")
     parser.add_argument("--deep-learning", action="store_true",
                         help="use a visual DQN movement policy (requires PyTorch)")
+    parser.add_argument("--evaluate", action="store_true",
+                        help="run a saved DQN with greedy movement and frozen learning")
+    parser.add_argument("--checkpoint", type=Path,
+                        default=DATA_PATH.parent / "visual_dqn_inlaid_library_8way.pt",
+                        help="DQN checkpoint to load and save")
+    parser.add_argument("--policy-dir", type=Path,
+                        help="directory containing movement and upgrade policy data")
     parser.add_argument("--max-runs", type=int, default=0,
                         help="stop after this many completed runs; 0 repeats until interrupted")
     parser.add_argument("--seconds", type=float, default=60.0, help="maximum live session")
@@ -668,6 +603,12 @@ def main() -> None:
                         help="append live JSONL training progress to this file")
     parser.add_argument("--pause-at-end", action="store_true", help="pause active play at session end")
     args = parser.parse_args()
+    if args.evaluate:
+        if args.attach:
+            parser.error("--evaluate needs a fresh run and cannot use --attach")
+        if not args.checkpoint.is_file():
+            parser.error(f"evaluation checkpoint does not exist: {args.checkpoint}")
+        args.full_run = args.deep_learning = True
     if args.full_run:
         args.control = True
         if args.evidence_dir is None:
@@ -676,11 +617,13 @@ def main() -> None:
             args.evidence_interval = 6.0
     if args.attach and not args.full_run:
         parser.error("--attach requires --full-run")
-    if (args.seconds <= 0 or args.action_seconds <= 0 or args.max_runs < 0
-            or args.evidence_interval <= 0 or args.focus_timeout <= 0):
+    durations = (args.seconds, args.action_seconds, args.evidence_interval, args.focus_timeout)
+    if any(not math.isfinite(value) or value <= 0 for value in durations) or args.max_runs < 0:
         parser.error("session, action, evidence, and focus durations must be positive; max-runs cannot be negative")
     if args.pause_at_end and not args.control:
         parser.error("--pause-at-end requires --control")
+    learning_enabled = args.control and not args.evaluate
+    movement_stats = args.policy_dir / DATA_PATH.name if args.policy_dir else DATA_PATH
     if args.evidence_dir:
         args.evidence_dir.mkdir(parents=True, exist_ok=True)
     if args.report_path:
@@ -694,15 +637,16 @@ def main() -> None:
     pending_dqn: tuple[object, int] | None = None
     if args.deep_learning:
         from dqn_policy import DQN_MOVE_INDICES, VisualDQN
-        dqn = VisualDQN(Path(__file__).parent / "data" / "visual_dqn_inlaid_library_8way.pt")
-        print(f"deep-learning: visual DQN on {dqn.device}; epsilon={dqn.epsilon:.3f}; "
+        dqn = VisualDQN(args.checkpoint)
+        epsilon = 0.0 if args.evaluate else dqn.epsilon
+        print(f"deep-learning: visual DQN on {dqn.device}; epsilon={epsilon:.3f}; "
               f"steps={dqn.steps}; updates={dqn.updates}", flush=True)
-    upgrades = UpgradeLearner()
+    upgrades = UpgradeLearner(args.policy_dir)
     run_id = uuid.uuid4().hex[:12]
     completed_runs = 0
     write_progress_report(
         args.report_path, "session_started", run_id=run_id,
-        deep_learning=args.deep_learning, max_runs=args.max_runs,
+        deep_learning=args.deep_learning, evaluation=args.evaluate, max_runs=args.max_runs,
     )
     evidence_run_dir = (args.evidence_dir / run_id
                         if args.evidence_dir and args.full_run else args.evidence_dir)
@@ -712,7 +656,7 @@ def main() -> None:
     run_levels = 0
     run_chests = 0
     run_xp = 0.0
-    counts, means = load_stats()
+    counts, means = load_stats(movement_stats)
     policy = ScreenSpaceDodge(
         args.player_x, args.player_y,
         action_counts=counts, action_means=means,
@@ -721,11 +665,10 @@ def main() -> None:
     kill_counter = KillCounter()
     gold_counter = GoldCounter()
     chest_detector = ChestPickupDetector(player_x=args.player_x, player_y=args.player_y)
-    treasure_open_latched = False
+    treasure_prompt_seen = False
+    treasure_click_at = float("-inf")
     treasure_text_checked_at = 0.0
     treasure_state_cache: str | None = None
-    level_text_checked_at = 0.0
-    level_state_cache = False
     over_text_checked_at = 0.0
     over_state_cache = False
 
@@ -769,32 +712,57 @@ def main() -> None:
             treasure_state_cache = "done"
         elif "treasure found" in text and "open" in text:
             treasure_state_cache = "open"
-        elif treasure_open_latched:
+        elif treasure_prompt_seen:
             treasure_state_cache = "animation"
         else:
             treasure_state_cache = None
         return treasure_state_cache
 
-    if args.control and args.full_run:
-        bridge.activate()  # Best effort; foreground activation may need user help.
-        if not args.attach and bridge.is_foreground():
-            initial_frame = bridge.capture()
-            initial_text = _label_key(read_screen_text(initial_frame))
-            if (confirmed_game_over(initial_frame)
-                    or ("survived" in initial_text and ("done" in initial_text or "results" in initial_text))):
-                print("startup: post-run screen found; returning to title before a fresh run", flush=True)
-                return_to_title_after_death(
-                    bridge, args.focus_timeout, reporter=screen_reporter,
-                )
-        start_configured_run(
-            bridge, args.focus_timeout, allow_active=args.attach,
-            reporter=screen_reporter, first_launch=True,
+    def click_treasure_prompt(state: str) -> None:
+        nonlocal treasure_click_at
+        now = time.monotonic()
+        if now - treasure_click_at < 1.0:
+            return
+        bridge.click_client(.50, .805)
+        treasure_click_at = now
+        print("treasure-found: opening the chest reward" if state == "open"
+              else "treasure-reward: clicking Done", flush=True)
+
+    def finish_session() -> None:
+        write_progress_report(
+            args.report_path, "session_stopped", completed_runs=completed_runs,
+            dqn_steps=dqn.steps if dqn else None,
+            dqn_updates=dqn.updates if dqn else None,
         )
-    elif args.control:
-        bridge.activate()  # Best effort; Windows may require a user click.
+
+    def save_dqn() -> None:
+        dqn.save()
+        print(f"deep-learning-saved: steps={dqn.steps}, updates={dqn.updates}, "
+              f"checkpoint={dqn.checkpoint}", flush=True)
+
+    def prepare_run() -> None:
+        nonlocal run_chests, treasure_prompt_seen
+        if not args.control:
+            return
+        bridge.activate()  # Best effort; foreground activation may need user help.
+        if args.full_run:
+            if not args.attach and bridge.is_foreground():
+                initial_frame = bridge.capture()
+                initial_text = _label_key(read_screen_text(initial_frame))
+                if (confirmed_game_over(initial_frame)
+                        or ("survived" in initial_text and ("done" in initial_text or "results" in initial_text))):
+                    print("startup: post-run screen found; returning to title before a fresh run", flush=True)
+                    return_to_title_after_death(
+                        bridge, args.focus_timeout, reporter=screen_reporter,
+                    )
+            start_configured_run(
+                bridge, args.focus_timeout, allow_active=args.attach,
+                reporter=screen_reporter, require_fresh=args.evaluate,
+            )
+            return
+
         ready_deadline = time.monotonic() + args.focus_timeout
         waiting_message = None
-        quick_start_clicked = False
         while True:
             if time.monotonic() >= ready_deadline:
                 raise RuntimeError(
@@ -807,127 +775,68 @@ def main() -> None:
                 screen_reporter.publish(None, "focus-required")
             else:
                 ready_frame = bridge.capture()
-                menu_text = read_screen_text(ready_frame).lower() if args.full_run else ""
                 ready_level_up = confirmed_level_up(ready_frame)
                 ready_treasure_state = (None if ready_level_up
                                         else treasure_screen_state(ready_frame))
-                if ready_treasure_state == "done":
-                    print("treasure-reward: clicking Done", flush=True)
-                    bridge.click_client(.50, .805)
-                    if not treasure_open_latched:
-                        run_chests += 1
-                    treasure_open_latched = False
-                    treasure_state_cache = None
-                    time.sleep(.35)
-                    verify_done = bridge.capture()
-                    verify_text = (read_screen_text(verify_done).lower()
-                                   if treasure_overlay_candidate(verify_done) else "")
-                    if "done" in verify_text:
-                        treasure_text_checked_at = 0.0
-                        treasure_state_cache = "done"
-                        message = "treasure-done: verifying the confirmation click"
-                    else:
-                        treasure_text_checked_at = 0.0
-                        message = "treasure-reward-claimed: waiting for gameplay"
-                elif ready_treasure_state in {"open", "animation"}:
-                    if ready_treasure_state == "open" and not treasure_open_latched:
-                        print("treasure-found: opening the chest reward", flush=True)
-                        bridge.click_client(.50, .805)
-                        treasure_open_latched = True
-                        run_chests += 1
-                        treasure_state_cache = "animation"
-                        time.sleep(.45)
-                    message = "treasure-opened: waiting for reward reveal"
-                elif (confirmed_game_over(ready_frame)
-                        and "quick start" not in menu_text):
+                if ready_treasure_state is not None:
+                    ready_phase = "treasure-reward"
+                    if ready_treasure_state in {"open", "done"}:
+                        if not treasure_prompt_seen:
+                            run_chests += 1
+                            treasure_prompt_seen = True
+                        click_treasure_prompt(ready_treasure_state)
+                    message = "treasure-reward: waiting for gameplay"
+                elif confirmed_game_over(ready_frame):
                     raise RuntimeError(
                         "The visible run is at Game Over. Start or revive a run, "
                         "then launch the controller again."
                     )
                 elif ready_level_up:
-                    if args.full_run:
-                        bridge.release_all()
-                        cards, raw = read_cards(ready_frame)
-                        choice_index = upgrades.choose(cards)
-                        chosen = cards[choice_index]
-                        print(f"upgrade-cards:{json.dumps({'cards': cards, 'raw': raw}, ensure_ascii=False)}", flush=True)
-                        print(f"upgrade-choice:slot={choice_index + 1},name={chosen or 'OCR-unknown'}", flush=True)
-                        click_x, click_y = card_click_position(choice_index, ready_frame)
-                        bridge.click_client(click_x, click_y)
-                        run_picks.append(chosen or f"Unknown card slot {choice_index + 1}")
-                        run_levels += 1
-                        time.sleep(MENU_POST_CLICK_DELAY)
-                        level_text_checked_at = 0.0
-                        level_state_cache = False
-                        message = "upgrade-selected: waiting for active gameplay"
-                    else:
-                        message = "level-up: choose a card; waiting without movement"
-                elif pause_menu_visible(ready_frame):
-                    message = "paused: resume the game; waiting without movement"
-                elif gameplay_hud_visible(ready_frame):
-                    if args.full_run and not (quick_start_clicked or args.attach):
-                        raise RuntimeError(
-                            "Full-run mode requires the title menu so it can start a fresh run; "
-                            "the screen is already in active gameplay."
-                        )
-                    if args.full_run:
-                        label = "attached-run" if args.attach else "new-run"
-                        print(f"ready: {label} HUD confirmed", flush=True)
-                    print("ready: game focused and active; controller starting", flush=True)
-                    break
-                elif args.full_run:
-                    if args.attach:
-                        message = "attach-mode: choose the same character and start the run; waiting for gameplay"
-                    elif "quick start" in menu_text and not quick_start_clicked:
-                        print("title-menu: OCR verified Quick Start; clicking it", flush=True)
-                        bridge.click_client(.65, .65)
-                        quick_start_clicked = True
-                        message = "starting: waiting for the new-run HUD"
-                    elif quick_start_clicked:
-                        message = "starting: waiting for the new-run HUD"
-                    else:
-                        message = "menu-check: Quick Start not confirmed; no click sent"
-                else:
-                    message = "waiting: looking for active gameplay; no movement sent"
-                if ready_level_up:
                     ready_phase = "upgrade-menu"
-                elif ready_treasure_state is not None:
-                    ready_phase = "treasure-reward"
-                elif confirmed_game_over(ready_frame):
-                    ready_phase = "game-over"
+                    message = "level-up: choose a card; waiting without movement"
                 elif pause_menu_visible(ready_frame):
                     ready_phase = "pause-menu"
+                    message = "paused: resume the game; waiting without movement"
                 elif gameplay_hud_visible(ready_frame):
-                    ready_phase = "gameplay"
-                elif "quick start" in menu_text:
-                    ready_phase = "title-menu"
+                    treasure_prompt_seen = False
+                    print("ready: game focused and active; controller starting", flush=True)
+                    break
                 else:
                     ready_phase = "unknown-screen"
-                screen_reporter.publish(
-                    ready_frame, ready_phase,
-                    screen_text=menu_text if menu_text else None,
-                )
+                    message = "waiting: looking for active gameplay; no movement sent"
+                screen_reporter.publish(ready_frame, ready_phase)
             if message != waiting_message:
                 print(message, flush=True)
                 waiting_message = message
             time.sleep(MENU_POLL_INTERVAL)
 
-    start = previous_time = time.monotonic()
-    next_evidence = 0.0
-    unknown_ocr_checked_at = 0.0
-    unknown_ocr_text = ""
-    action = None
-    last_state = None
-    focus_lost_since: float | None = None
-    end_choice_deadline: float | None = None
-    print("elapsed_s,xp_fill,health_fill,action,danger,kills,kill_reward,xp_reward,level_reward,chest_reward,lamp_reward,chicken_reward,damage_penalty,total,state", flush=True)
-    try:
+    with ExitStack() as cleanup:
+        cleanup.callback(finish_session)
+        if learning_enabled:
+            cleanup.callback(save_stats, counts, means, movement_stats)
+            if dqn is not None:
+                cleanup.callback(save_dqn)
+        if args.control:
+            cleanup.callback(bridge.release_all)
+        prepare_run()
+        start = previous_time = time.monotonic()
+        next_evidence = 0.0
+        unknown_ocr_checked_at = 0.0
+        unknown_ocr_text = ""
+        unlock_back_last_attempt = 0.0
+        action = None
+        last_state = None
+        focus_lost_since: float | None = None
+        end_choice_deadline: float | None = None
+        print("elapsed_s,xp_fill,health_fill,action,danger,kills,kill_reward,xp_reward,level_reward,chest_reward,lamp_reward,chicken_reward,damage_penalty,total,state", flush=True)
         while True:
             if args.control and not bridge.is_foreground():
                 screen_reporter.publish(None, "focus-required")
                 bridge.release_all()
                 action = None
                 if focus_lost_since is None:
+                    dqn_state = pending_dqn = None
+                    tracker.reset()
                     focus_lost_since = time.monotonic()
                     print("focus-lost: movement released; checking whether play needs pausing", flush=True)
                     lost_frame = bridge.capture()
@@ -963,13 +872,16 @@ def main() -> None:
             level_up = confirmed_level_up(frame)
             treasure_state = (None if level_up else treasure_screen_state(frame))
             treasure = treasure_state is not None
-            if not treasure:
-                treasure_open_latched = False
-            chest_prompt_event = (treasure_state in {"open", "done"}
-                                  and not treasure_open_latched)
+            chest_prompt = treasure_state in {"open", "done"}
+            chest_prompt_event = chest_prompt and not treasure_prompt_seen
             game_over = not (level_up or treasure) and confirmed_game_over(frame)
             paused = not (level_up or treasure or game_over) and pause_menu_visible(frame)
             active = not (level_up or treasure or game_over or paused) and gameplay_hud_visible(frame)
+            if args.control and not active:
+                bridge.release_all()
+            if active or level_up or game_over:
+                treasure_prompt_seen = False
+                treasure_click_at = float("-inf")
             state = ("level-up" if level_up else "treasure" if treasure else
                      "game-over" if game_over else "paused" if paused else
                      "play" if active else "waiting")
@@ -979,29 +891,28 @@ def main() -> None:
                 "play": "gameplay", "waiting": "unknown-screen",
             }[state]
             diagnostic_text = None
-            if state == "waiting" and now - unknown_ocr_checked_at >= UNKNOWN_SCREEN_OCR_INTERVAL:
-                unknown_ocr_text = read_screen_text(frame)
-                unknown_ocr_checked_at = now
+            if state == "waiting":
+                if now - unknown_ocr_checked_at >= UNKNOWN_SCREEN_OCR_INTERVAL:
+                    unknown_ocr_text = read_screen_text(frame)
+                    unknown_ocr_checked_at = now
                 diagnostic_text = unknown_ocr_text
+                if "interestedinthis" in _label_key(unknown_ocr_text):
+                    phase = "unlock-menu"
+            else:
+                unknown_ocr_checked_at = 0.0
+                unknown_ocr_text = ""
             screen_reporter.publish(frame, phase, screen_text=diagnostic_text)
             fill = xp_bar_fill(frame)
+            if chest_prompt_event:
+                treasure_prompt_seen = True
+                chest_detector.reset()
             chest_collected = chest_detector.update(frame, active=active)
             chest_collected = chest_collected or chest_prompt_event
             if chest_collected:
                 run_chests += 1
 
-            if treasure_state == "open" and not treasure_open_latched and args.full_run:
-                bridge.release_all()
-                print("treasure-found: opening the chest reward", flush=True)
-                bridge.click_client(.50, .805)
-                treasure_open_latched = True
-                treasure_state_cache = "animation"
-            elif treasure_state == "done" and args.full_run:
-                bridge.release_all()
-                print("treasure-reward: clicking Done", flush=True)
-                bridge.click_client(.50, .805)
-                treasure_open_latched = False
-                treasure_state_cache = None
+            if chest_prompt and args.full_run:
+                click_treasure_prompt(treasure_state)
 
             if active or level_up or game_over or chest_collected:
                 observed_health = (
@@ -1025,26 +936,24 @@ def main() -> None:
                     choice, danger = action
                     action_name = "+".join(MOVES[choice])
                     total -= min(danger * 1.5, .5)
-                    if args.control:
+                    if learning_enabled:
                         counts[choice] += 1
                         means[choice] += (total - means[choice]) / counts[choice]
                         policy.update_learning_stats(counts, means)
-                if dqn is not None and (active or level_up or game_over):
+                if dqn is not None:
+                    terminal = game_over or level_up or chest_prompt_event
                     if active:
                         dqn_state = (dqn.reset(frame) if dqn_state is None
                                      else dqn.advance(frame))
-                    elif dqn_state is not None:
+                    elif terminal and pending_dqn is not None:
                         dqn_state = dqn.advance(frame)
-                    if pending_dqn is not None and dqn_state is not None:
+                    if pending_dqn is not None and (active or terminal):
                         old_state, old_action = pending_dqn
-                        loss = dqn.observe(old_state, old_action, total, dqn_state,
-                                           game_over or level_up)
+                        loss = dqn.observe(old_state, old_action, total, dqn_state, terminal)
                         if loss is not None:
                             print(f"dqn-update:steps={dqn.steps},updates={dqn.updates},"
                                   f"loss={loss:.4f},epsilon={dqn.epsilon:.3f}", flush=True)
                         pending_dqn = None
-                    if level_up or game_over:
-                        dqn_state = None
                 if active or state != last_state:
                     write_progress_report(
                         args.report_path, "progress", run_id=run_id,
@@ -1079,6 +988,8 @@ def main() -> None:
                 )
                 print(f"{elapsed:.2f},-,-,-,-,-,0,0,0,0,0,0,{state}", flush=True)
                 tracker.reset()
+            if not active:
+                dqn_state = pending_dqn = None
 
             if evidence_run_dir and (elapsed >= next_evidence or state != last_state):
                 output = evidence_run_dir / f"{elapsed:06.2f}-{state}.jpg"
@@ -1086,7 +997,8 @@ def main() -> None:
                     raise RuntimeError(f"Could not save {output}")
                 next_evidence = elapsed + args.evidence_interval
 
-            timed_out = (not args.full_run) and elapsed >= args.seconds
+            session_deadline = start + args.seconds
+            timed_out = not args.full_run and now >= session_deadline
             if timed_out and args.pause_at_end and level_up and not game_over:
                 if end_choice_deadline is None:
                     end_choice_deadline = now + 60.0
@@ -1110,12 +1022,16 @@ def main() -> None:
                 if args.full_run and game_over:
                     run_result = {
                         "run_id": run_id, "seconds": round(elapsed, 2),
+                        "game_seconds": read_game_timer_seconds(
+                            frame, maximum=None if args.attach and completed_runs == 0 else elapsed + 2,
+                        ),
                         "levels": run_levels, "chests": run_chests,
                         "kills": kill_counter.total,
                         "xp_reward": round(run_xp, 4), "picks": run_picks,
                         "result": "game_over",
                     }
-                    upgrades.record_run(run_result)
+                    if learning_enabled:
+                        upgrades.record_run(run_result)
                     write_progress_report(
                         args.report_path, "run_completed", **run_result,
                         completed_runs=completed_runs + 1,
@@ -1124,12 +1040,12 @@ def main() -> None:
                     )
                     print(f"run-result:{json.dumps(run_result, sort_keys=True)}", flush=True)
                     completed_runs += 1
-                    if dqn is not None:
-                        dqn.save()
                     if args.max_runs and completed_runs >= args.max_runs:
                         print(f"run-limit: completed {completed_runs} runs", flush=True)
                         break
-                    print(f"run-restart: completed={completed_runs}; preparing next Poe / Mad Forest run", flush=True)
+                    if dqn is not None and learning_enabled:
+                        dqn.save()
+                    print(f"run-restart: completed={completed_runs}; preparing next Gennaro / Inlaid Library run", flush=True)
                     return_to_title_after_death(
                         bridge, args.focus_timeout, reporter=screen_reporter,
                     )
@@ -1150,11 +1066,10 @@ def main() -> None:
                     chest_detector = ChestPickupDetector(
                         player_x=args.player_x, player_y=args.player_y,
                     )
-                    treasure_open_latched = False
+                    treasure_prompt_seen = False
+                    treasure_click_at = float("-inf")
                     treasure_text_checked_at = 0.0
                     treasure_state_cache = None
-                    level_text_checked_at = 0.0
-                    level_state_cache = False
                     over_text_checked_at = 0.0
                     over_state_cache = False
                     dqn_state = None
@@ -1163,7 +1078,7 @@ def main() -> None:
                     last_state = None
                     next_evidence = 0.0
                     start_configured_run(
-                        bridge, args.focus_timeout, reporter=screen_reporter,
+                        bridge, args.focus_timeout, reporter=screen_reporter, require_fresh=args.evaluate,
                     )
                     start = previous_time = time.monotonic()
                     continue
@@ -1173,7 +1088,7 @@ def main() -> None:
                 bridge.release_all()
                 run_levels += 1
                 cards, raw = read_cards(frame)
-                choice_index = upgrades.choose(cards)
+                choice_index = upgrades.choose(cards, raw)
                 chosen = cards[choice_index]
                 print(
                     f"upgrade-cards:{json.dumps({'cards': cards, 'raw': raw}, ensure_ascii=False)}",
@@ -1184,8 +1099,6 @@ def main() -> None:
                 bridge.click_client(click_x, click_y)
                 run_picks.append(chosen or f"Unknown card slot {choice_index + 1}")
                 time.sleep(MENU_POST_CLICK_DELAY)
-                level_text_checked_at = 0.0
-                level_state_cache = False
                 verify = bridge.capture()
                 if level_up_visible(verify):
                     print("upgrade-click: level-up panel remains; checking for a queued choice", flush=True)
@@ -1198,56 +1111,52 @@ def main() -> None:
 
             if active:
                 if dqn is not None and dqn_state is not None:
-                    dqn_action = dqn.act(dqn_state)
+                    dqn_action = dqn.act(dqn_state, explore=learning_enabled)
                     choice = DQN_MOVE_INDICES[dqn_action]
                     action = (choice, 0.0)
-                    pending_dqn = (dqn_state.copy(), dqn_action)
                 else:
                     scene = policy.observe(frame, level_up=False)
-                    action = (scene.choice, scene.threat[scene.choice])
+                    choice = scene.choice
+                    action = (choice, scene.threat[choice])
                 if args.control:
                     try:
                         bridge.set_movement(MOVES[choice])
                     except RuntimeError:
                         # Focus may change after the check at the top of the
-                        # loop but before SendInput. Route that race through
+                        # loop but before movement. Route that race through
                         # the same safe focus-loss handler on the next pass.
                         if bridge.is_foreground():
                             raise
                         bridge.release_all()
                         action = None
-                        focus_lost_since = time.monotonic()
+                        dqn_state = pending_dqn = None
+                        tracker.reset()
+                        previous_time = time.monotonic()
                         print(
                             "focus-lost: movement refused during action; "
                             "checking whether play needs pausing",
                             flush=True,
                         )
+                        continue
+                    if learning_enabled and dqn is not None and dqn_state is not None:
+                        pending_dqn = (dqn_state, dqn_action)
             else:
                 action = None
-                if args.control:
-                    bridge.release_all()
+                if args.control and phase == "unlock-menu" and now - unlock_back_last_attempt >= 1.5:
+                    bridge.click_client(.50, .80)
+                    unlock_back_last_attempt = now
+                    print("unlock-menu: clicked Back", flush=True)
 
             previous_time = now
             last_state = state
             period = args.action_seconds if active else .12
-            remaining = float("inf") if args.full_run else max(0, args.seconds - elapsed)
-            time.sleep(min(period, remaining))
-    finally:
-        write_progress_report(
-            args.report_path, "session_stopped", completed_runs=completed_runs,
-            dqn_steps=dqn.steps if dqn else None,
-            dqn_updates=dqn.updates if dqn else None,
-        )
-        if args.control:
-            bridge.release_all()
-            save_stats(counts, means)
-        if dqn is not None:
-            dqn.save()
-            print(f"deep-learning-saved: steps={dqn.steps}, updates={dqn.updates}, "
-                  f"checkpoint={dqn.checkpoint}", flush=True)
+            deadline = end_choice_deadline if timed_out and end_choice_deadline is not None else session_deadline
+            remaining = float("inf") if args.full_run else max(0, deadline - time.monotonic())
+            if remaining:
+                time.sleep(min(period, remaining))
 
-    if args.control:
-        print(f"Action counts: {counts}. Statistics saved to {DATA_PATH}", flush=True)
+    if learning_enabled:
+        print(f"Action counts: {counts}. Statistics saved to {movement_stats}", flush=True)
 
 
 if __name__ == "__main__":

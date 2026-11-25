@@ -76,12 +76,12 @@ class VisualDQN:
         batch_size: int = 64,
         gamma: float = 0.99,
         learning_rate: float = 0.0001,
-        warmup: int = 512,
+        warmup: int = 128,
         train_every: int = 4,
         target_every: int = 2_000,
         epsilon_start: float = 1.0,
         epsilon_end: float = 0.05,
-        epsilon_steps: int = 100_000,
+        epsilon_steps: int = 30_000,
         seed: int = 7,
     ) -> None:
         random.seed(seed)
@@ -126,9 +126,10 @@ class VisualDQN:
         return self._state()
 
     def act(self, state: np.ndarray, *, explore: bool = True) -> int:
-        self.steps += 1
-        if explore and random.random() < self.epsilon:
-            return random.randrange(ACTION_COUNT)
+        if explore:
+            self.steps += 1
+            if random.random() < self.epsilon:
+                return random.randrange(ACTION_COUNT)
         with torch.no_grad():
             tensor = torch.from_numpy(state).to(self.device).unsqueeze(0).float() / 255.0
             return int(self.online(tensor).argmax(dim=1).item())

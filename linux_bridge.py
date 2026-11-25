@@ -36,19 +36,10 @@ class VampireSurvivorsBridge:
             import mss
         except ImportError as exc:
             raise ImportError("Linux screen capture requires mss: python -m pip install mss") from exc
-        # Find a visible game window before opening an X11 capture connection.
-        # If lookup fails, no display client is left behind by a partial init.
+        self._mss = mss.mss()
         self.window_title = window_title.casefold()
         self._held: set[str] = set()
         self.window_id = self._find_window()[0]
-        self._mss = mss.mss()
-
-    def close(self) -> None:
-        """Release the X11 connection used by MSS."""
-        capture = getattr(self, "_mss", None)
-        if capture is not None:
-            self._mss = None
-            capture.close()
 
     def _run(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(args, capture_output=True, text=True, timeout=5)
@@ -135,15 +126,6 @@ class VampireSurvivorsBridge:
         self._run("xdotool", "mousemove", "--window", self.window_id,
                   str(px), str(py), "sleep", "0.04",
                   "mousedown", "1", "sleep", "0.06", "mouseup", "1")
-
-    def press_key(self, key: str) -> None:
-        """Tap a supported menu key after confirming the game has focus."""
-        key_name = {"enter": "Return", "space": "space"}.get(key.casefold())
-        if key_name is None:
-            raise ValueError(f"Unsupported menu key: {key}")
-        if not self.is_foreground():
-            raise RuntimeError("Vampire Survivors is not foreground; refusing key input")
-        self._run("xdotool", "key", key_name)
 
     def key_down(self, direction: str) -> bool:
         """Return whether this bridge currently holds the requested movement key."""

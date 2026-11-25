@@ -15,7 +15,8 @@ import numpy as np
 
 
 _LEVEL_UP_TEMPLATE_PATH = Path(__file__).parent / "data" / "level_up_header.png"
-_LEVEL_UP_TEMPLATE = cv2.imread(str(_LEVEL_UP_TEMPLATE_PATH), cv2.IMREAD_GRAYSCALE)
+_LEVEL_UP_TEMPLATE = (cv2.imread(str(_LEVEL_UP_TEMPLATE_PATH), cv2.IMREAD_GRAYSCALE)
+                      if _LEVEL_UP_TEMPLATE_PATH.is_file() else None)
 
 
 @dataclass(frozen=True)
@@ -61,13 +62,13 @@ def health_bar_fill(
     *,
     player_x: float = 0.50,
     player_y: float = 0.47,
-    full_width: float = 0.047,
+    full_width: float = 0.0375,
 ) -> float | None:
     """Estimate the red player-health bar fill beneath the centered avatar.
 
     Returns ``None`` when the expected bar is not visible. The ROI is small
-    and screen-relative; the longest contiguous red run rejects most unrelated
-    damage particles and enemies elsewhere on the screen.
+    and screen-relative. The full red span is 72 pixels in a 1920-pixel
+    capture. Requiring saturated red excludes reddish terrain behind the bar.
     """
     height, width = frame_bgr.shape[:2]
     x0 = max(0, round((player_x - 0.03) * width))
@@ -79,8 +80,8 @@ def health_bar_fill(
         return None
 
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    red = (cv2.inRange(hsv, (0, 130, 80), (12, 255, 255)) |
-           cv2.inRange(hsv, (168, 130, 80), (179, 255, 255)))
+    red = (cv2.inRange(hsv, (0, 200, 160), (8, 255, 255)) |
+           cv2.inRange(hsv, (172, 200, 160), (179, 255, 255)))
     columns = (red > 0).sum(axis=0) >= max(3, round(crop.shape[0] * 0.25))
     # Close tiny gaps caused by pixel animation/compression before measuring.
     columns = cv2.morphologyEx(
@@ -92,7 +93,7 @@ def health_bar_fill(
     longest = int(np.max(ends - starts)) if len(starts) else 0
     if longest < max(5, round(width * 0.004)):
         return None
-    return min(longest / max(width * full_width, 1.0), 1.0)
+    return min(longest / max(round(width * full_width), 1), 1.0)
 
 
 def six_choice_grid_visible(frame_bgr: np.ndarray) -> bool:
@@ -157,6 +158,14 @@ def weapon_selection_grid_visible(frame_bgr: np.ndarray) -> bool:
                            for column in range(len(columns)))
     return complete_rows >= 4 and complete_columns
 
+
+def _dominant_color_fraction(panel: np.ndarray, size: tuple[int, int]) -> float:
+    small = cv2.resize(panel, size, interpolation=cv2.INTER_AREA)
+    # Each channel has one bin per eight integer color values.
+    counts = cv2.calcHist([small], [0, 1, 2], None, [32, 32, 32], [0, 256] * 3)
+    return float(counts.max()) / (size[0] * size[1])
+
+
 def level_up_visible(frame_bgr: np.ndarray) -> bool:
     """Detect the known centered Level Up heading, with a color fallback."""
     height, width = frame_bgr.shape[:2]
@@ -168,13 +177,13 @@ def level_up_visible(frame_bgr: np.ndarray) -> bool:
              max(8, round(_LEVEL_UP_TEMPLATE.shape[0] * scale))),
             interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC,
         )
-        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        search = gray[
+        heading = frame_bgr[
             round(.11 * height):round(.23 * height),
             round(.38 * width):round(.63 * width),
         ]
-        if (search.shape[0] >= template.shape[0]
-                and search.shape[1] >= template.shape[1]):
+        if (heading.shape[0] >= template.shape[0]
+                and heading.shape[1] >= template.shape[1]):
+            search = cv2.cvtColor(heading, cv2.COLOR_BGR2GRAY)
             score = float(cv2.matchTemplate(search, template, cv2.TM_CCOEFF_NORMED).max())
             if score >= .72:
                 return True
@@ -200,10 +209,7 @@ def level_up_visible(frame_bgr: np.ndarray) -> bool:
     # Library floors and newer stage artwork can exceed this color ratio in
     # ordinary play. A real card screen also has one broad, flat slate panel;
     # quantized dominant-color coverage separates that overlay from scenery.
-    small = cv2.resize(panel, (128, 180), interpolation=cv2.INTER_AREA)
-    _, counts = np.unique((small // 8).reshape(-1, 3), axis=0, return_counts=True)
-    flat_panel = float(counts.max() / max(counts.sum(), 1))
-    if coverage < 0.15 or flat_panel < 0.18:
+    if coverage < 0.15 or _dominant_color_fraction(panel, (128, 180)) < 0.18:
         return False
     # Require at least two of the four gray card rows. A chest reward prompt
     # has the same large slate panel, but no level-up cards.
@@ -230,12 +236,11 @@ def treasure_overlay_candidate(frame_bgr: np.ndarray) -> bool:
     panel = frame_bgr[
         round(.12 * height):round(.90 * height),
         round(.33 * width):round(.67 * width),
+        :3,
     ]
     if panel.size == 0:
         return False
-    small = cv2.resize(panel, (96, 160), interpolation=cv2.INTER_AREA)
-    _, counts = np.unique((small // 8).reshape(-1, 3), axis=0, return_counts=True)
-    return float(counts.max() / max(counts.sum(), 1)) > 0.20
+    return _dominant_color_fraction(panel, (96, 160)) > 0.20
 
 
 @dataclass(frozen=True)
@@ -297,7 +302,8 @@ class ChestPickupDetector:
         pickup_radius: float = 15.0,
     ) -> None:
         self.template_path = template_path or Path(__file__).parent / "data" / "chest_template.png"
-        self.template = cv2.imread(str(self.template_path), cv2.IMREAD_COLOR)
+        self.template = (cv2.imread(str(self.template_path), cv2.IMREAD_COLOR)
+                         if self.template_path.is_file() else None)
         # Keep the trainer usable without redistributing a game-derived sprite.
         # Chest rewards from the opened modal are still detected separately.
         self.player_x = min(max(float(player_x), 0.05), 0.95)
@@ -305,6 +311,10 @@ class ChestPickupDetector:
         self.match_threshold = min(max(float(match_threshold), 0.0), 1.0)
         self.pickup_radius = max(float(pickup_radius), 1.0)
         self._tracks: list[_ChestTrack] = []
+
+    def reset(self) -> None:
+        """Forget sprite tracks after the pickup has been confirmed by its menu."""
+        self._tracks.clear()
 
     def _candidates(self, frame_bgr: np.ndarray) -> list[tuple[float, float]]:
         if self.template is None:
@@ -339,7 +349,7 @@ class ChestPickupDetector:
 
     def update(self, frame_bgr: np.ndarray, *, active: bool) -> bool:
         """Return true once a previously nearby chest is confirmed collected."""
-        if not active:
+        if not active or self.template is None:
             return False
         width, height = frame_bgr.shape[1], frame_bgr.shape[0]
         scale = min(640 / width, 360 / height)

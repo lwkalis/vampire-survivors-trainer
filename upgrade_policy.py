@@ -8,6 +8,7 @@ import io
 import json
 import math
 import os
+import random
 import re
 import subprocess
 import tempfile
@@ -30,8 +31,12 @@ BASE_VALUE = {
     "Laurel": 9.5, "Armor": 9.0, "Duplicator": 8.8, "Empty Tome": 8.6,
     "Pummarola": 8.4, "Garlic": 8.2, "Attractorb": 8.0, "Crown": 7.9,
     "Spinach": 7.8, "King Bible": 7.7, "Magic Wand": 7.6,
-    "Fire Wand": 6.7, "Pentagram": 5.9,
+    "Fire Wand": 6.7, "Lightning Ring": 7.4, "Pentagram": 5.9,
     "Runetracer": 7.6, "Whip": 7.5, "Santa Javelin": 7.5,
+    "Song of Mana": 7.7, "Gatti Amari": 6.4, "Shadow Pinion": 6.8,
+    "Peachone": 7.0, "Ebony Wings": 7.0, "Phiera Der Tuphello": 7.2,
+    "Eight The Sparrow": 7.2, "Vento Sacro": 7.3, "Glass Fandango": 7.3,
+    "Bracelet": 6.8, "Unearthly Bolt": 7.6, "Ammo Appalate": 7.4,
     "Gaze of Gaea": 7.8, "Parma Aegis": 8.6,
     "Clock Lancet": 7.4, "Wings": 7.3, "Tiragisu": 7.2,
     "Hollow Heart": 7.2, "Spellbinder": 7.0, "Candelabrador": 7.0,
@@ -153,7 +158,7 @@ def card_click_position(index: int, frame: np.ndarray) -> tuple[float, float]:
 
 def read_screen_ocr(
     frame: np.ndarray, *, white_text: bool = False, page_mode: int | None = None,
-    digits_only: bool = False,
+    digits_only: bool = False, whitelist: str | None = None,
 ) -> tuple[str, list[dict[str, object]]]:
     """Return full-screen OCR text and line boxes for menu navigation."""
     if os.name != "nt":
@@ -168,7 +173,9 @@ def read_screen_ocr(
         if page_mode is not None:
             command.extend(("--psm", str(page_mode)))
         if digits_only:
-            command.extend(("-c", "tessedit_char_whitelist=0123456789"))
+            whitelist = "0123456789"
+        if whitelist is not None:
+            command.extend(("-c", f"tessedit_char_whitelist={whitelist}"))
         try:
             result = subprocess.run(
                 [*command, "tsv"], input=encoded.tobytes(),
@@ -336,6 +343,30 @@ def read_game_over_heading(frame: np.ndarray) -> str:
     return read_screen_ocr(gold, page_mode=7)[0]
 
 
+def read_game_timer_seconds(frame: np.ndarray, *, maximum: float | None = None) -> int | None:
+    """Read the top-center gameplay clock from the Game Over screen."""
+    height, width = frame.shape[:2]
+    crop = frame[round(.05 * height):round(.082 * height),
+                 round(.467 * width):round(.533 * width), :3]
+    if not crop.size:
+        return None
+    timer = cv2.resize(crop, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+    hsv = cv2.cvtColor(timer, cv2.COLOR_BGR2HSV)
+    pale = cv2.bitwise_not(cv2.inRange(hsv, (0, 0, 144), (179, 119, 255)))
+    gray = cv2.cvtColor(timer, cv2.COLOR_BGR2GRAY)
+    _, contrast = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+    readings = set()
+    for image, page_mode in ((pale, 7), (contrast, 7), (gray, 8)):
+        image = cv2.copyMakeBorder(image, 10, 10, 10, 10, cv2.BORDER_CONSTANT, value=255)
+        text, _ = read_screen_ocr(image, page_mode=page_mode, whitelist="0123456789:")
+        match = re.fullmatch(r"(\d{2}):([0-5]\d):?", text.strip())
+        if match:
+            seconds = 60 * int(match[1]) + int(match[2])
+            if maximum is None or seconds <= maximum:
+                readings.add(seconds)
+    return readings.pop() if len(readings) == 1 else None
+
+
 def read_screen_text(frame: np.ndarray) -> str:
     """Read all visible text on a game screen."""
     return read_screen_ocr(frame)[0]
@@ -344,19 +375,36 @@ def read_screen_text(frame: np.ndarray) -> str:
 class UpgradeLearner:
     """Rank visible cards and learn shared outcome associations across runs."""
 
-    def __init__(self) -> None:
+    def __init__(self, policy_dir: Path | None = None) -> None:
         self.stats: dict[str, dict[str, float]] = {}
+        self.stats_path = policy_dir / STATS_PATH.name if policy_dir else STATS_PATH
+        self.history_path = policy_dir / HISTORY_PATH.name if policy_dir else HISTORY_PATH
         try:
-            saved = json.loads(STATS_PATH.read_text(encoding="utf-8"))
+            saved = json.loads(self.stats_path.read_text(encoding="utf-8"))
             if isinstance(saved, dict):
                 self.stats = saved
         except (OSError, ValueError, TypeError):
             pass
 
-    def choose(self, cards: list[str | None]) -> int:
+    def choose(self, cards: list[str | None], raw: list[str] | None = None) -> int:
+        raw = raw or []
+        is_new = [bool(re.search(r"\bnew\b", raw[i], re.IGNORECASE))
+                  if i < len(raw) else False for i in range(len(cards))]
         available = [i for i, name in enumerate(cards) if name]
+        owned = [i for i in available if not is_new[i]]
+        if owned:
+            available = owned
+        else:
+            # OCR can read a card's New! badge even when it misses the title.
+            # Prefer a readable non-new card over a new weapon in that case.
+            readable_owned = [i for i in range(len(cards))
+                              if i < len(raw) and raw[i].strip() and not is_new[i]]
+            if readable_owned:
+                return random.choice(readable_owned)
         if not available:
-            return 0  # Safe automatic fallback; the exact title is logged.
+            # Never systematically favor the top card when OCR misses every
+            # title. Selection remains unbiased until the OCR can identify it.
+            return random.randrange(len(cards)) if cards else 0
         total = sum(float(item.get("count", 0)) for item in self.stats.values())
         def score(index: int) -> float:
             name = cards[index]
@@ -367,7 +415,9 @@ class UpgradeLearner:
             exploration = .45 * math.sqrt(math.log(total + 2) / (count + 1))
             learned = .70 * (mean - .5)
             return BASE_VALUE.get(name, 5.0) + learned + min(exploration, .7)
-        return max(available, key=score)
+        best = max(score(index) for index in available)
+        tied = [index for index in available if abs(score(index) - best) < 1e-9]
+        return random.choice(tied)
 
     def record_run(self, run: dict[str, object]) -> None:
         reported_picks = sorted(set(str(x) for x in run.get("picks", []) if x))
@@ -388,10 +438,11 @@ class UpgradeLearner:
             n = float(item.get("count", 0)) + 1
             item["mean"] = float(item.get("mean", .5)) + (outcome - float(item.get("mean", .5))) / n
             item["count"] = n
-        STATS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        STATS_PATH.write_text(json.dumps(self.stats, indent=2, sort_keys=True), encoding="utf-8")
-        HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with HISTORY_PATH.open("a", encoding="utf-8") as stream:
+        self.stats_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.stats_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(self.stats, indent=2, sort_keys=True), encoding="utf-8")
+        temporary.replace(self.stats_path)
+        with self.history_path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps({**run, "outcome": outcome}, sort_keys=True) + "\n")
 
 
